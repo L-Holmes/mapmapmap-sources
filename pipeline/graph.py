@@ -114,9 +114,13 @@ def build(pbf, dem_path, out):
     refs, xs, ys = array("q"), array("i"), array("i")
     starts, factors = array("q", [0]), array("f")
     fp = osmium.FileProcessor(pbf).with_locations().with_filter(osmium.filter.KeyFilter("highway"))
+    seen = 0
     for w in fp:
         if not w.is_way():
             continue
+        seen += 1
+        if seen % 1_000_000 == 0:
+            print(f"    read {seen // 1_000_000}M roads and paths, {time.time() - t:.0f}s", flush=True)
         f = factor(w.tags)
         if f is None:
             continue

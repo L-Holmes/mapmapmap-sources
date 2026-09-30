@@ -1,0 +1,32 @@
+# Shared by the pipeline's scripts (sourced, from the repository root).
+
+REPO=${REPO:-L-Holmes/mapmapmap-sources}
+RELEASES="https://github.com/$REPO/releases"
+STARTED=${STARTED:-$SECONDS}
+export STARTED
+
+# One build or upload at a time in this folder: two would overwrite each
+# other's files. A script run by another (update-maps.sh running build.sh)
+# shares its parent's hold.
+lock() {
+  [[ -n "${MAPS_LOCK_HELD:-}" ]] && return
+  mkdir -p data
+  exec 9>data/.lock
+  if ! flock -n 9; then
+    echo "error: another map build or upload is already running in this folder" >&2
+    echo "       (started by: $(cat data/.lock.who 2>/dev/null || echo unknown)). Wait for it to finish." >&2
+    exit 1
+  fi
+  echo "$0, pid $$, $(date '+%F %T')" > data/.lock.who
+  export MAPS_LOCK_HELD=1
+}
+
+elapsed() {
+  local s=$((SECONDS - STARTED))
+  printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+}
+
+# step <n> <of> <what> <how long it usually takes>
+step() {
+  printf '\n==> [%s/%s] %s  (usually %s; %s in so far, %s)\n' "$1" "$2" "$3" "$4" "$(elapsed)" "$(date +%H:%M)"
+}

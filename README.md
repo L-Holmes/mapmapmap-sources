@@ -28,23 +28,33 @@ Great Britain is 3.2 GB.
 ./update-maps.sh
 ```
 
-That is the whole job: it fetches the newest OpenStreetMap data, rebuilds
-every region, and publishes them here as a new release. Monthly is plenty.
-Apps notice the newer data the next time they check and offer each region's
-update; no app release is needed.
+That is the whole job. In order, it:
 
-It needs, on the machine that runs it:
+1. finishes an upload that stopped partway, if there is one;
+2. checks whether OpenStreetMap has newer data than what is published, and
+   stops there if not (`--force` rebuilds anyway);
+3. downloads the newest data and rebuilds every region (about an hour);
+4. publishes them here as a new release (about 50 minutes for ~8.5 GB at
+   3 MB/s).
+
+Each step says what it is doing, how long it usually takes and how long the
+run has taken so far; downloads and uploads show their progress. Only one
+build or upload runs at a time in this folder: a second says so and stops,
+rather than overwriting the first one's files. Anything interrupted picks up
+where it left off when run again. Apps notice newer data the next time they
+check and offer each region's update; no app release is needed.
+
+Monthly is plenty. It needs, on the machine that runs it:
 
 - Java 21 or newer, and [uv](https://docs.astral.sh/uv/) (Python packages
   install themselves into `data/.venv` the first time)
 - the GitHub CLI, `gh`, logged in once with `gh auth login`
-- ~40 GB of disk, ~24 GB of RAM, and about an hour, then an ~8.5 GB upload
-  (about 50 minutes at 3 MB/s)
+- ~40 GB of disk and ~24 GB of RAM
 
 Everything it downloads and builds stays in `data/` (gitignored).
-
-`pipeline/build.sh` and `pipeline/publish.sh` are the two halves, to run
-separately if wanted. `pipeline/serve.sh` serves `data/out` to a
+`pipeline/build.sh` and `pipeline/publish.sh` are its two halves, to run
+separately if wanted (`pipeline/build.sh --download-only` just fetches the
+data). `pipeline/serve.sh` serves `data/out` to a
 USB-attached phone, to try a build before publishing it.
 
 ### How a release is published
@@ -52,7 +62,11 @@ USB-attached phone, to try a build before publishing it.
 - Every release holds every region under the same names, so `latest` is
   always a complete set. It is made as a draft and published only once every
   file is up, so no app ever sees a catalogue whose files are still
-  uploading.
+  uploading. While a new release uploads, the previous one stays `latest`.
+- The download addresses (`releases/latest/download/<file>`) work only once
+  a release is published: GitHub answers them with a redirect to the newest
+  published release's file, and with 404 while there is none. There is no
+  page at `releases/latest/download/` itself.
 - The catalogue's `version` is the OSM data's date. An installed region
   older than it is offered its update; the old files stay in use until the
   new ones are in and checked.
