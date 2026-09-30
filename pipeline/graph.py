@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+The walking graph: every way a walker can use, split at junctions, with a
+cost per direction, cut into one file per download region.
+
+    graph.py build <osm.pbf> <dem.npy> <out.npz>
+    graph.py cut <graph.npz> <regions.json> <out dir>
+
+build reads Great Britain once. cut writes <out dir>/<region>.graph for
+each region: the edges within ~2 km of its outline, in the binary format
+the app reads (the app's routing/Graph.kt, which documents it). Node ids are
+global, so graphs of neighbouring regions join where they meet.
+
+Cost is metres of flat walking: an edge's length times a factor for the
+kind of way it is (1.0 for a path or a right of way, more for roads the
+busier they are, more for hard or faint paths), plus Naismith's rule for
+the climbing: 1 m up costs as much as 8 m along.
+"""
+import json
+import os
+import sys
+import time
+from array import array
+
+import numpy as np
+
+CLIMB = 8.0
+# The factor for each kind of way. None of these are below 1, which is what
+# makes straight-line distance a safe A* heuristic in the app.
+BASE = {
+    "path": 1.0, "footway": 1.0, "bridleway": 1.0, "track": 1.0, "steps": 1.2,
+    "pedestrian": 1.05, "cycleway": 1.15, "living_street": 1.2,
+    "residential": 1.25, "service": 1.25, "unclassified": 1.3, "road": 1.3,
+    "tertiary": 1.6, "tertiary_link": 1.6,
+    "secondary": 2.2, "secondary_link": 2.2,
+    "primary": 3.0, "primary_link": 3.0,
+    "trunk": 5.0, "trunk_link": 5.0,
+}
+ROW = {"public_footpath", "public_bridleway", "restricted_byway", "byway_open_to_all_traffic", "public_byway", "byway"}
+SAC = {"demanding_mountain_hiking": 1.2, "alpine_hiking": 2.0, "demanding_alpine_hiking": 4.0, "difficult_alpine_hiking": 6.0}
+SIDEWALK = {"both", "left", "right", "yes"}
+# Edge geometry is simplified this far (degrees, ~2 m) once its length and
+# climb have been measured on the full detail.
+SIMPLIFY = 2e-5
+# The snapping grid's cell, in 1e-7 degrees: 0.01 degrees, ~1.1 km north-south.
+CELL = 100_000
+BUFFER = 0.02
+# Networks smaller than this are dropped: a path mapped without joining
+# anything else, a farmyard's tracks. Snapping to one strands the walker,
+# since there is no route from it to anywhere.
+MIN_COMPONENT_EDGES = 50
+MAGIC = 0x52474D4D  # "MMGR"
+VERSION = 1
+
+
+def factor(tags):
+    base = BASE.get(tags.get("highway"))
+    if base is None or tags.get("area") == "yes" or tags.get("indoor") == "yes":
+        return None
+    foot = tags.get("foot")
+    if foot in ("no", "private", "use_sidepath"):
+        return None
+    if tags.get("access") in ("no", "private") and foot not in ("yes", "designated", "permissive"):
+        return None
+    if tags.get("designation") in ROW:
+        base = 1.0
+    elif base > 1.3 and (tags.get("sidewalk") in SIDEWALK or foot == "designated"):
+        base = 1.3
+    base *= SAC.get(tags.get("sac_scale"), 1.0)
+    if tags.get("trail_visibility") in ("bad", "horrible", "no"):
+        base *= 1.5
+    return base
+
+
+def elevation(dem, lat_e7, lon_e7):
+    """Heights in decimetres, bilinear from the OS Terrain 50 grid."""
+    import pyproj
+    to_osgb = pyproj.Transformer.from_crs(4326, 27700, always_xy=True)
+    e, n = to_osgb.transform(lon_e7 / 1e7, lat_e7 / 1e7)
+    c = np.clip((e - 25.0) / 50.0, 0, dem.shape[1] - 1.001)
+    r = np.clip((n - 25.0) / 50.0, 0, dem.shape[0] - 1.001)
+    c0, r0 = c.astype(np.int64), r.astype(np.int64)
+    fc, fr = c - c0, r - r0
+    z = (dem[r0, c0] * (1 - fc) * (1 - fr) + dem[r0, c0 + 1] * fc * (1 - fr)
+         + dem[r0 + 1, c0] * (1 - fc) * fr + dem[r0 + 1, c0 + 1] * fc * fr)
+    return np.round(np.maximum(z, 0) * 10).astype(np.int16)
+
+
+def seg_lengths(lat, lon):
+    """Metres between consecutive points."""
+    la = np.radians(lat / 1e7)
+    lo = np.radians(lon / 1e7)
+    dla = np.diff(la)
+    dlo = np.diff(lo) * np.cos((la[1:] + la[:-1]) / 2)
+    return 6371008.8 * np.hypot(dla, dlo)
+
+
+def morton(lat, lon):
+    def spread(v):
+        v = v.astype(np.uint64) & 0xFFFF
+        v = (v | (v << 8)) & 0x00FF00FF
+        v = (v | (v << 4)) & 0x0F0F0F0F
+        v = (v | (v << 2)) & 0x33333333
+        v = (v | (v << 1)) & 0x55555555
+        return v
+    y = ((lat.astype(np.int64) + 900_000_000) >> 15)
+    x = ((lon.astype(np.int64) + 1_800_000_000) >> 16)
+    return spread(x) | (spread(y) << np.uint64(1))
+
+
+def build(pbf, dem_path, out):
+    import osmium
+    t = time.time()
+    refs, xs, ys = array("q"), array("i"), array("i")
+    starts, factors = array("q", [0]), array("f")
+    fp = osmium.FileProcessor(pbf).with_locations().with_filter(osmium.filter.KeyFilter("highway"))
+    for w in fp:
+        if not w.is_way():
+            continue
+        f = factor(w.tags)
+        if f is None:
+            continue
+        nodes = w.nodes
+        if len(nodes) < 2:
+            continue
+        try:
+            for nd in nodes:
+                xs.append(nd.x)
+                ys.append(nd.y)
+                refs.append(nd.ref)
+        except osmium.InvalidLocationError:
+            # A way reaching outside the extract: drop what was added of it.
+            del refs[starts[-1]:], xs[starts[-1]:], ys[starts[-1]:]
+            continue
+        starts.append(len(refs))
+        factors.append(f)
+    refs = np.frombuffer(refs, dtype=np.int64)
+    lon = np.frombuffer(xs, dtype=np.int32)
+    lat = np.frombuffer(ys, dtype=np.int32)
+    starts = np.frombuffer(starts, dtype=np.int64)
+    factors = np.frombuffer(factors, dtype=np.float32)
+    print(f"read {len(factors)} ways, {len(refs)} refs in {time.time() - t:.0f}s")
+
+    # Junctions: nodes shared by two ways or used twice, and every way's ends.
+    uniq, inv, counts = np.unique(refs, return_inverse=True, return_counts=True)
+    junction = counts[inv] >= 2
+    junction[starts[:-1]] = True
+    junction[starts[1:] - 1] = True
+    j = np.flatnonzero(junction)
+    way_of = np.searchsorted(starts, j, side="right") - 1
+    pair = way_of[:-1] == way_of[1:]
+    a, b = j[:-1][pair], j[1:][pair]
+    edge_factor = factors[way_of[:-1][pair]]
+    print(f"{len(a)} edges")
+
+    # Each edge's points, full detail, concatenated.
+    n_pts = b - a + 1
+    offs = np.zeros(len(a) + 1, dtype=np.int64)
+    np.cumsum(n_pts, out=offs[1:])
+    idx = np.arange(offs[-1]) - np.repeat(offs[:-1] - a, n_pts)
+    g_lat, g_lon = lat[idx], lon[idx]
+
+    dem = np.load(dem_path, mmap_mode="r")
+    g_ele = elevation(dem, g_lat, g_lon).astype(np.float32) / 10
+    seg = seg_lengths(g_lat, g_lon)
+    rise = np.diff(g_ele)
+    # Segments that run from one edge into the next are not segments.
+    last = offs[1:-1] - 1
+    seg[last] = 0
+    rise[last] = 0
+    seg_start = offs[:-1]
+    # reduceat needs a start per edge; every edge has at least one segment.
+    length = np.add.reduceat(np.append(seg, 0), seg_start)
+    up = np.add.reduceat(np.append(np.maximum(rise, 0), 0), seg_start)
+    down = np.add.reduceat(np.append(np.maximum(-rise, 0), 0), seg_start)
+    length = length.astype(np.float32)
+    cost_f = (length * edge_factor + CLIMB * up).astype(np.float32)
+    cost_b = (length * edge_factor + CLIMB * down).astype(np.float32)
+
+    # Nodes, numbered along a Morton curve so neighbours sit together in the
+    # file, which is what the app's memory-mapped reads want.
+    node_ref, first = np.unique(refs[j], return_index=True)
+    node_lat, node_lon = lat[j][first], lon[j][first]
+    order = np.argsort(morton(node_lat, node_lon), kind="stable")
+    rank = np.empty_like(order)
+    rank[order] = np.arange(len(order))
+    node_lat, node_lon = node_lat[order], node_lon[order]
+    u = rank[np.searchsorted(node_ref, refs[a])].astype(np.int32)
+    v = rank[np.searchsorted(node_ref, refs[b])].astype(np.int32)
+
+    # Simplified geometry, ends kept exactly.
+    import shapely
+    lines = shapely.linestrings(np.column_stack([g_lon / 1e7, g_lat / 1e7]), indices=np.repeat(np.arange(len(a)), n_pts))
+    lines = shapely.simplify(lines, SIMPLIFY, preserve_topology=False)
+    # A way whose points all sit in one place simplifies to nothing; it
+    # keeps its two ends.
+    broken = np.flatnonzero(shapely.get_num_coordinates(lines) < 2)
+    if len(broken):
+        ends = np.stack([
+            np.column_stack([g_lon[offs[broken]], g_lat[offs[broken]]]),
+            np.column_stack([g_lon[offs[broken + 1] - 1], g_lat[offs[broken + 1] - 1]]),
+        ], axis=1) / 1e7
+        lines[broken] = shapely.linestrings(ends)
+    coords, which = shapely.get_coordinates(lines, return_index=True)
+    s_lat = np.round(coords[:, 1] * 1e7).astype(np.int32)
+    s_lon = np.round(coords[:, 0] * 1e7).astype(np.int32)
+    s_offs = np.zeros(len(a) + 1, dtype=np.int64)
+    np.cumsum(np.bincount(which, minlength=len(a)), out=s_offs[1:])
+    s_ele = elevation(dem, s_lat, s_lon)
+    print(f"{len(node_lat)} nodes, {len(g_lat)} -> {len(s_lat)} points in {time.time() - t:.0f}s")
+
+    np.savez(
+        out,
+        node_lat=node_lat, node_lon=node_lon,
+        u=u, v=v, length=length, cost_f=cost_f, cost_b=cost_b,
+        geom=s_offs, lat=s_lat, lon=s_lon, ele=s_ele,
+    )
+
+
+def cut(npz_path, regions_path, out_dir):
+    import shapely
+    from shapely.geometry import shape
+    os.makedirs(out_dir, exist_ok=True)
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    g = np.load(npz_path)
+    u, v, geom = g["u"], g["v"], g["geom"]
+    lat, lon = g["lat"], g["lon"]
+    n_nodes = len(g["node_lat"])
+
+    _, label = connected_components(coo_matrix((np.ones(len(u)), (u, v)), shape=(n_nodes, n_nodes)), directed=False)
+    size = np.bincount(label[u])
+    kept = np.flatnonzero(size[label[u]] >= MIN_COMPONENT_EDGES)
+    print(f"{len(u) - len(kept)} edges in small networks dropped")
+
+    degree = np.bincount(np.concatenate([u[kept], v[kept]]), minlength=n_nodes)
+    n_pts = np.diff(geom)[kept]
+    starts = geom[kept]
+    offs = np.zeros(len(kept) + 1, dtype=np.int64)
+    np.cumsum(n_pts, out=offs[1:])
+    idx = np.arange(offs[-1]) - np.repeat(offs[:-1] - starts, n_pts)
+    lines = shapely.linestrings(np.column_stack([lon[idx] / 1e7, lat[idx] / 1e7]), indices=np.repeat(np.arange(len(kept)), n_pts))
+    tree = shapely.STRtree(lines)
+    for region in json.load(open(regions_path)):
+        t = time.time()
+        if region["parent"] is None:
+            sel = kept
+        else:
+            area = shape(region["geometry"]).buffer(BUFFER)
+            sel = kept[np.sort(tree.query(area, predicate="intersects"))]
+        path = os.path.join(out_dir, region["id"] + ".graph")
+        write_region(path, g, sel, degree)
+        print(f"{region['id']}: {len(sel)} edges, {os.path.getsize(path) / 1e6:.1f} MB in {time.time() - t:.0f}s")
+
+
+def write_region(path, g, sel, degree):
+    u_all, v_all = g["u"], g["v"]
+    geom = g["geom"]
+    nodes = np.unique(np.concatenate([u_all[sel], v_all[sel]]))
+    u = np.searchsorted(nodes, u_all[sel]).astype(np.int32)
+    v = np.searchsorted(nodes, v_all[sel]).astype(np.int32)
+    n, e = len(nodes), len(sel)
+
+    local_degree = np.bincount(np.concatenate([u, v]), minlength=n)
+    border = np.flatnonzero(local_degree < degree[nodes]).astype(np.int32)
+
+    # Adjacency: each edge once from each end, e from u and ~e from v.
+    at = np.concatenate([u, v])
+    ref = np.concatenate([np.arange(e, dtype=np.int32), ~np.arange(e, dtype=np.int32)])
+    order = np.argsort(at, kind="stable")
+    adj = ref[order]
+    adj_start = np.zeros(n + 1, dtype=np.int32)
+    np.cumsum(np.bincount(at, minlength=n), out=adj_start[1:])
+
+    # Geometry of the chosen edges.
+    counts = (geom[sel + 1] - geom[sel]).astype(np.int64)
+    offs = np.zeros(e + 1, dtype=np.int64)
+    np.cumsum(counts, out=offs[1:])
+    idx = np.arange(offs[-1]) - np.repeat(offs[:-1] - geom[sel], counts)
+    lat, lon, ele = g["lat"][idx], g["lon"][idx], g["ele"][idx]
+
+    # The snapping grid: every cell each segment's box touches lists the edge.
+    min_lat = int(lat.min() // CELL * CELL)
+    min_lon = int(lon.min() // CELL * CELL)
+    rows = int((lat.max() - min_lat) // CELL + 1)
+    cols = int((lon.max() - min_lon) // CELL + 1)
+    edge_of_pt = np.repeat(np.arange(e, dtype=np.int64), counts)
+    same = edge_of_pt[:-1] == edge_of_pt[1:]
+    s_edge = edge_of_pt[:-1][same]
+    r0 = (np.minimum(lat[:-1], lat[1:])[same] - min_lat) // CELL
+    r1 = (np.maximum(lat[:-1], lat[1:])[same] - min_lat) // CELL
+    c0 = (np.minimum(lon[:-1], lon[1:])[same] - min_lon) // CELL
+    c1 = (np.maximum(lon[:-1], lon[1:])[same] - min_lon) // CELL
+    nr, nc = r1 - r0 + 1, c1 - c0 + 1
+    k = (nr * nc).astype(np.int64)
+    rep_edge = np.repeat(s_edge, k)
+    within = np.arange(k.sum()) - np.repeat(np.cumsum(k) - k, k)
+    rr = np.repeat(r0, k) + within // np.repeat(nc, k)
+    cc = np.repeat(c0, k) + within % np.repeat(nc, k)
+    cell = rr.astype(np.int64) * cols + cc
+    key = np.unique(cell * e + rep_edge)
+    cell, cell_edge = key // e, (key % e).astype(np.int32)
+    grid_start = np.zeros(rows * cols + 1, dtype=np.int32)
+    np.cumsum(np.bincount(cell, minlength=rows * cols), out=grid_start[1:])
+
+    header = np.zeros(16, dtype="<i4")
+    header[:12] = [MAGIC, VERSION, n, e, len(lat), len(border), cols, rows, min_lat, min_lon, CELL, len(cell_edge)]
+    with open(path, "wb") as f:
+        for part in (
+            header,
+            nodes.astype("<i4"), g["node_lat"][nodes].astype("<i4"), g["node_lon"][nodes].astype("<i4"),
+            adj_start.astype("<i4"), adj.astype("<i4"),
+            u.astype("<i4"), v.astype("<i4"),
+            g["length"][sel].astype("<f4"), g["cost_f"][sel].astype("<f4"), g["cost_b"][sel].astype("<f4"),
+            offs.astype("<i4"),
+            lat.astype("<i4"), lon.astype("<i4"),
+            ele.astype("<i2"), np.zeros(len(ele) % 2, dtype="<i2"),
+            border.astype("<i4"),
+            grid_start.astype("<i4"), cell_edge.astype("<i4"),
+        ):
+            f.write(part.tobytes())
+
+
+def main():
+    if sys.argv[1] == "build":
+        build(*sys.argv[2:5])
+    elif sys.argv[1] == "cut":
+        cut(*sys.argv[2:5])
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

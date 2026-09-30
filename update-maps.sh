@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 #
-# Rebuild and republish every map region. See README.md.
+# Update the maps everyone downloads: fetch the newest OpenStreetMap data,
+# rebuild every region, and publish them here as a new release.
 #
-# The pipeline is in the app's repository, expected beside this one.
+#   ./update-maps.sh
+#
+# Run it by hand whenever the maps should catch up with OpenStreetMap
+# (monthly is plenty). Takes about an hour, then uploads ~8.5 GB. No app
+# release is needed: apps see the new data the next time they check, and
+# offer each region's update. See README.md for what it needs.
 #
 set -euo pipefail
 cd "$(dirname "$0")"
-APP=${MAPMAPMAP_APP:-../mapmapmap}
-[[ -x "$APP/tools/update-maps.sh" ]] || {
-  echo "error: the app repository is not at $APP; set MAPMAPMAP_APP to where it is" >&2
-  exit 1
-}
-exec "$APP/tools/update-maps.sh" L-Holmes/mapmapmap-sources
+pipeline/build.sh --fresh
+pipeline/publish.sh
