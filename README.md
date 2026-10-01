@@ -1,8 +1,8 @@
 # mapmapmap-sources
 
 The map data the [mapmapmap](https://github.com/L-Holmes/APP-map-map-map)
-Android app downloads: offline hiking maps and walking-route graphs for
-Great Britain, and the pipeline that builds them.
+Android app downloads: offline hiking maps, and walking and driving route
+graphs, for Great Britain, and the pipeline that builds them.
 
 The files are not in the git history. Each **release** holds a full set of
 regions, and the app always reads the newest:
@@ -16,6 +16,7 @@ https://github.com/L-Holmes/mapmapmap-sources/releases/latest/download/catalog.j
 | `catalog.json` | Every region's files, with sizes and SHA-256, the data's date, and the format version |
 | `<region>.mbtiles` | Vector map tiles, zooms 8 to 14: roads, paths, public rights of way, waymarked routes, 10 m contours, land and water |
 | `<region>.graph` | The walking graph the app plans routes on |
+| `<region>.driving.graph` | The driving graph the app plans car routes on |
 | `overview.mbtiles`, `app-regions.json` | What the app ships inside itself: zooms 0 to 7 everywhere, and the region outlines. The app repository's `tools/refresh-assets.sh` copies them in. |
 
 Regions: all of Great Britain, England, Scotland, Wales, and England's 47
@@ -104,6 +105,7 @@ countries, and England's 47 counties.
 | `pipeline/tiles.py merge` | Both tile sets in one file. A vector tile's layers are a repeated protobuf field, so two tiles' bytes, concatenated, are one tile with both sets of layers. |
 | `pipeline/tiles.py cut` | Each region's tiles, z8 and up, within ~2 km of its outline, and the z0-7 overview the app ships (`overview.mbtiles`, 1.5 MB). Tiles are deduplicated: the sea is stored once. |
 | `pipeline/graph.py build` | The walking graph for all of Great Britain: walkable ways split at junctions, each edge costed both ways. |
+| `pipeline/graph.py build-driving` | The driving graph for all of Great Britain: roads cars may use, and car ferries, costed by speed each way. |
 | `pipeline/graph.py cut` | Each region's graph, in the app's binary format (documented in the app's `routing/Graph.kt`). Networks of under 50 edges, mapped without joining anything, are dropped: snapping to one would strand a route. |
 | `pipeline/catalog.py` | `catalog.json`: each region's files, sizes and SHA-256, and the version (the OSM data's date). |
 
@@ -127,6 +129,31 @@ indoor ways are left out. No factor is under 1, which is what lets the app's
 A* use straight-line distance as its heuristic and still find the cheapest
 route. Graph node ids are global, so regions that overlap share junctions,
 and the app routes across them as one network.
+
+### The driving graph
+
+The same file layout, over roads a car may use. Cost is metres at motorway
+speed (110 km/h): an edge's length times 110 over the speed a car makes on
+it, so again no factor is under 1. The file's header carries the 110, which
+is how the app turns a cost into a driving time.
+
+| Road | km/h |
+| --- | --- |
+| Motorway, trunk, primary, secondary, tertiary | 110, 90, 70, 60, 50 |
+| Their slip roads | 60, 50, 45, 40, 35 |
+| Unclassified, residential, other road | 40, 30, 30 |
+| Service road, living street | 15, 10 |
+| Car ferry (`motorcar` or `motor_vehicle=yes`) | 20 |
+
+A speed limit lowers a road's speed to 90% of the limit when that is lower
+(`30 mph`, `GB:nsl_single` and the like). One-way roads, roundabouts and
+motorways cost infinity the wrong way. Private roads, driveways and roads
+closed to cars are left out. Turn restrictions are not modelled.
+
+Only roads a car can both reach and leave are kept (strongly connected
+components of 50 edges or more): a one-way road into a car park whose way
+out is not mapped for cars would otherwise be a trap a route could start
+in and never get out of.
 
 ## Sizes (September 2026 data)
 

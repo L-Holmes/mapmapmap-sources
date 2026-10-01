@@ -65,7 +65,7 @@ if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   # ever sees a catalogue whose files are still uploading.
   NOTES="Map data for Great Britain from OpenStreetMap, $VERSION, and OS Terrain 50.
 
-Each region is two files: \`<region>.mbtiles\` (vector map tiles) and \`<region>.graph\` (the walking graph the app routes on). \`catalog.json\` lists them with their sizes and SHA-256. \`overview.mbtiles\` and \`app-regions.json\` are what the app ships inside itself.
+Each region is three files: \`<region>.mbtiles\` (vector map tiles), \`<region>.graph\` (the walking graph the app routes on) and \`<region>.driving.graph\` (the driving graph). \`catalog.json\` lists them with their sizes and SHA-256. \`overview.mbtiles\` and \`app-regions.json\` are what the app ships inside itself.
 
 © OpenStreetMap contributors, available under the Open Database Licence. Contains OS data © Crown copyright and database right."
   gh release create "$TAG" --repo "$REPO" --draft --title "Maps $VERSION" --notes "$NOTES"

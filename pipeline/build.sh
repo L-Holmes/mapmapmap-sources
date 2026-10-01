@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build every region's map and walking graph, into data/out.
+# Build every region's map, walking graph and driving graph, into data/out.
 #
 #   pipeline/build.sh            build from the OpenStreetMap data already here
 #                                (downloading it if there is none)
@@ -31,7 +31,7 @@ lock
 SRC=data/src WORK=data/work OUT=data/out
 PY=data/.venv/bin/python
 mkdir -p "$SRC" "$WORK" "$OUT"
-STEPS=9
+STEPS=10
 
 # --- Tools ---------------------------------------------------------------------
 
@@ -136,7 +136,11 @@ step 8 $STEPS "Walking graph" "about 20 minutes"
 $PY -u pipeline/graph.py build "$SRC/united-kingdom.osm.pbf" "$WORK/terrain/dem.npy" "$WORK/graph.npz"
 $PY -u pipeline/graph.py cut "$WORK/graph.npz" "$WORK/regions.json" "$OUT"
 
-step 9 $STEPS "Catalogue: sizes and checksums" "under a minute"
+step 9 $STEPS "Driving graph" "about 15 minutes"
+$PY -u pipeline/graph.py build-driving "$SRC/united-kingdom.osm.pbf" "$WORK/terrain/dem.npy" "$WORK/driving.npz"
+$PY -u pipeline/graph.py cut "$WORK/driving.npz" "$WORK/regions.json" "$OUT"
+
+step 10 $STEPS "Catalogue: sizes and checksums" "under a minute"
 $PY pipeline/catalog.py "$WORK/regions.json" "$OUT" "$VERSION"
 
 echo

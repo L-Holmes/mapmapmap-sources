@@ -13,7 +13,7 @@ import json
 import os
 import sys
 
-KINDS = ("mbtiles", "graph")
+KINDS = ("mbtiles", "graph", "driving.graph")
 # What an app needs to understand these files: the tiles' layers and the
 # graph's binary layout. Raise it when either changes in a way an installed
 # app cannot read; apps built for an older format then leave the new files

@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """
-The walking graph: every way a walker can use, split at junctions, with a
-cost per direction, cut into one file per download region.
+The walking and driving graphs: every way a walker, or a car, can use,
+split at junctions, with a cost per direction, cut into one file per
+download region.
 
     graph.py build <osm.pbf> <dem.npy> <out.npz>
+    graph.py build-driving <osm.pbf> <dem.npy> <out.npz>
     graph.py cut <graph.npz> <regions.json> <out dir>
 
 build reads Great Britain once. cut writes <out dir>/<region>.graph for
-each region: the edges within ~2 km of its outline, in the binary format
-the app reads (the app's routing/Graph.kt, which documents it). Node ids are
-global, so graphs of neighbouring regions join where they meet.
+each region (<region>.driving.graph for a driving graph): the edges within
+~2 km of its outline, in the binary format the app reads (the app's
+routing/Graph.kt, which documents it). Node ids are global, so graphs of
+neighbouring regions join where they meet.
 
-Cost is metres of flat walking: an edge's length times a factor for the
-kind of way it is (1.0 for a path or a right of way, more for roads the
+Walking cost is metres of flat walking: an edge's length times a factor for
+the kind of way it is (1.0 for a path or a right of way, more for roads the
 busier they are, more for hard or faint paths), plus Naismith's rule for
 the climbing: 1 m up costs as much as 8 m along.
+
+Driving cost is metres at motorway speed: an edge's length times
+DRIVE_KMH over the speed a car makes along it (the road's usual speed,
+lowered to its limit where that is lower). The file's header carries
+DRIVE_KMH, which is how the app turns a cost back into a time. The way a
+one-way road does not go costs infinity. Car ferries are in, at FERRY_KMH;
+turn restrictions are not.
 """
 import json
 import os
@@ -39,6 +49,24 @@ BASE = {
 ROW = {"public_footpath", "public_bridleway", "restricted_byway", "byway_open_to_all_traffic", "public_byway", "byway"}
 SAC = {"demanding_mountain_hiking": 1.2, "alpine_hiking": 2.0, "demanding_alpine_hiking": 4.0, "difficult_alpine_hiking": 6.0}
 SIDEWALK = {"both", "left", "right", "yes"}
+
+# Driving: the usual speed on each kind of road, km/h, before any limit
+# lowers it. The fastest is DRIVE_KMH, so no factor is below 1 here either.
+DRIVE_KMH = 110
+SPEED = {
+    "motorway": 110, "motorway_link": 60, "trunk": 90, "trunk_link": 50,
+    "primary": 70, "primary_link": 45, "secondary": 60, "secondary_link": 40,
+    "tertiary": 50, "tertiary_link": 35, "unclassified": 40, "road": 30,
+    "residential": 30, "living_street": 10, "service": 15,
+}
+FERRY_KMH = 20
+# Limits as British mapping writes them, km/h.
+NATIONAL = {
+    "gb:nsl_single": 96, "uk:nsl_single": 96, "national": 96,
+    "gb:nsl_dual": 112, "uk:nsl_dual": 112, "gb:motorway": 112, "uk:motorway": 112,
+}
+NO_CARS = {"no", "private", "agricultural", "forestry", "delivery", "emergency"}
+ONEWAY = {"yes", "true", "1"}
 # Edge geometry is simplified this far (degrees, ~2 m) once its length and
 # climb have been measured on the full detail.
 SIMPLIFY = 2e-5
@@ -47,10 +75,20 @@ CELL = 100_000
 BUFFER = 0.02
 # Networks smaller than this are dropped: a path mapped without joining
 # anything else, a farmyard's tracks. Snapping to one strands the walker,
-# since there is no route from it to anywhere.
+# since there is no route from it to anywhere. For driving, a network is
+# the roads a car can both get to and get back from each other by (one
+# strongly connected component): a one-way road into a car park whose way
+# out is not mapped for cars is a network of its own, and a car snapped to
+# it could never leave.
 MIN_COMPONENT_EDGES = 50
 MAGIC = 0x52474D4D  # "MMGR"
 VERSION = 1
+
+
+def walk(tags):
+    """The walking factor, the same both ways; None if walkers cannot use it."""
+    f = factor(tags)
+    return None if f is None else (f, f)
 
 
 def factor(tags):
@@ -70,6 +108,48 @@ def factor(tags):
     if tags.get("trail_visibility") in ("bad", "horrible", "no"):
         base *= 1.5
     return base
+
+
+def limit(tags):
+    """The speed limit in km/h, if the way has one that can be read."""
+    v = (tags.get("maxspeed") or "").strip().lower()
+    if v in NATIONAL:
+        return NATIONAL[v]
+    try:
+        return float(v[:-3]) * 1.609 if v.endswith("mph") else float(v)
+    except ValueError:
+        return None
+
+
+def drive(tags):
+    """The driving factors, forwards and backwards (infinite the way a car
+    may not go); None if cars cannot use the way at all."""
+    if tags.get("route") == "ferry":
+        if "yes" not in (tags.get("motorcar"), tags.get("motor_vehicle")):
+            return None
+        f = DRIVE_KMH / FERRY_KMH
+        return f, f
+    highway = tags.get("highway")
+    speed = SPEED.get(highway)
+    if speed is None or tags.get("area") == "yes":
+        return None
+    if tags.get("service") in ("driveway", "emergency_access"):
+        return None
+    # The most particular of these that is given decides.
+    car = tags.get("motorcar") or tags.get("motor_vehicle") or tags.get("vehicle")
+    if car in NO_CARS or (car is None and tags.get("access") in NO_CARS):
+        return None
+    lim = limit(tags)
+    if lim:
+        speed = min(speed, lim * 0.9)
+    f = DRIVE_KMH / max(speed, 5)
+    oneway = tags.get("oneway")
+    if oneway == "-1":
+        return float("inf"), f
+    if oneway in ONEWAY or (oneway != "no" and (
+            tags.get("junction") in ("roundabout", "circular") or highway in ("motorway", "motorway_link"))):
+        return f, float("inf")
+    return f, f
 
 
 def elevation(dem, lat_e7, lon_e7):
@@ -108,12 +188,15 @@ def morton(lat, lon):
     return spread(x) | (spread(y) << np.uint64(1))
 
 
-def build(pbf, dem_path, out):
+def build(pbf, dem_path, out, driving=False):
     import osmium
     t = time.time()
     refs, xs, ys = array("q"), array("i"), array("i")
-    starts, factors = array("q", [0]), array("f")
-    fp = osmium.FileProcessor(pbf).with_locations().with_filter(osmium.filter.KeyFilter("highway"))
+    starts, forward, backward = array("q", [0]), array("f"), array("f")
+    keys = ("highway", "route") if driving else ("highway",)
+    profile = drive if driving else walk
+    climb = 0.0 if driving else CLIMB
+    fp = osmium.FileProcessor(pbf).with_locations().with_filter(osmium.filter.KeyFilter(*keys))
     seen = 0
     for w in fp:
         if not w.is_way():
@@ -121,7 +204,7 @@ def build(pbf, dem_path, out):
         seen += 1
         if seen % 1_000_000 == 0:
             print(f"    read {seen // 1_000_000}M roads and paths, {time.time() - t:.0f}s", flush=True)
-        f = factor(w.tags)
+        f = profile(w.tags)
         if f is None:
             continue
         nodes = w.nodes
@@ -137,13 +220,15 @@ def build(pbf, dem_path, out):
             del refs[starts[-1]:], xs[starts[-1]:], ys[starts[-1]:]
             continue
         starts.append(len(refs))
-        factors.append(f)
+        forward.append(f[0])
+        backward.append(f[1])
     refs = np.frombuffer(refs, dtype=np.int64)
     lon = np.frombuffer(xs, dtype=np.int32)
     lat = np.frombuffer(ys, dtype=np.int32)
     starts = np.frombuffer(starts, dtype=np.int64)
-    factors = np.frombuffer(factors, dtype=np.float32)
-    print(f"read {len(factors)} ways, {len(refs)} refs in {time.time() - t:.0f}s")
+    forward = np.frombuffer(forward, dtype=np.float32)
+    backward = np.frombuffer(backward, dtype=np.float32)
+    print(f"read {len(forward)} ways, {len(refs)} refs in {time.time() - t:.0f}s")
 
     # Junctions: nodes shared by two ways or used twice, and every way's ends.
     uniq, inv, counts = np.unique(refs, return_inverse=True, return_counts=True)
@@ -154,7 +239,8 @@ def build(pbf, dem_path, out):
     way_of = np.searchsorted(starts, j, side="right") - 1
     pair = way_of[:-1] == way_of[1:]
     a, b = j[:-1][pair], j[1:][pair]
-    edge_factor = factors[way_of[:-1][pair]]
+    factor_f = forward[way_of[:-1][pair]]
+    factor_b = backward[way_of[:-1][pair]]
     print(f"{len(a)} edges")
 
     # Each edge's points, full detail, concatenated.
@@ -178,8 +264,10 @@ def build(pbf, dem_path, out):
     up = np.add.reduceat(np.append(np.maximum(rise, 0), 0), seg_start)
     down = np.add.reduceat(np.append(np.maximum(-rise, 0), 0), seg_start)
     length = length.astype(np.float32)
-    cost_f = (length * edge_factor + CLIMB * up).astype(np.float32)
-    cost_b = (length * edge_factor + CLIMB * down).astype(np.float32)
+    # Infinity times a zero length would be no number at all.
+    with np.errstate(invalid="ignore"):
+        cost_f = np.where(np.isinf(factor_f), np.inf, length * factor_f + climb * up).astype(np.float32)
+        cost_b = np.where(np.isinf(factor_b), np.inf, length * factor_b + climb * down).astype(np.float32)
 
     # Nodes, numbered along a Morton curve so neighbours sit together in the
     # file, which is what the app's memory-mapped reads want.
@@ -218,6 +306,7 @@ def build(pbf, dem_path, out):
         node_lat=node_lat, node_lon=node_lon,
         u=u, v=v, length=length, cost_f=cost_f, cost_b=cost_b,
         geom=s_offs, lat=s_lat, lon=s_lon, ele=s_ele,
+        speed=np.int32(DRIVE_KMH if driving else 0),
     )
 
 
@@ -232,9 +321,21 @@ def cut(npz_path, regions_path, out_dir):
     lat, lon = g["lat"], g["lon"]
     n_nodes = len(g["node_lat"])
 
-    _, label = connected_components(coo_matrix((np.ones(len(u)), (u, v)), shape=(n_nodes, n_nodes)), directed=False)
-    size = np.bincount(label[u])
-    kept = np.flatnonzero(size[label[u]] >= MIN_COMPONENT_EDGES)
+    speed = int(g["speed"]) if "speed" in g else 0
+    if speed:
+        # Each way an edge can be driven, as an arc.
+        fwd = np.isfinite(g["cost_f"])
+        back = np.isfinite(g["cost_b"])
+        tail = np.concatenate([u[fwd], v[back]])
+        head = np.concatenate([v[fwd], u[back]])
+        _, label = connected_components(
+            coo_matrix((np.ones(len(tail)), (tail, head)), shape=(n_nodes, n_nodes)), directed=True, connection="strong")
+        inside = label[u] == label[v]
+    else:
+        _, label = connected_components(coo_matrix((np.ones(len(u)), (u, v)), shape=(n_nodes, n_nodes)), directed=False)
+        inside = np.ones(len(u), dtype=bool)
+    size = np.bincount(label[u][inside], minlength=label.max() + 1)
+    kept = np.flatnonzero(inside & (size[label[u]] >= MIN_COMPONENT_EDGES))
     print(f"{len(u) - len(kept)} edges in small networks dropped")
 
     degree = np.bincount(np.concatenate([u[kept], v[kept]]), minlength=n_nodes)
@@ -245,6 +346,7 @@ def cut(npz_path, regions_path, out_dir):
     idx = np.arange(offs[-1]) - np.repeat(offs[:-1] - starts, n_pts)
     lines = shapely.linestrings(np.column_stack([lon[idx] / 1e7, lat[idx] / 1e7]), indices=np.repeat(np.arange(len(kept)), n_pts))
     tree = shapely.STRtree(lines)
+    suffix = ".driving.graph" if speed else ".graph"
     for region in json.load(open(regions_path)):
         t = time.time()
         if region["parent"] is None:
@@ -252,12 +354,12 @@ def cut(npz_path, regions_path, out_dir):
         else:
             area = shape(region["geometry"]).buffer(BUFFER)
             sel = kept[np.sort(tree.query(area, predicate="intersects"))]
-        path = os.path.join(out_dir, region["id"] + ".graph")
-        write_region(path, g, sel, degree)
+        path = os.path.join(out_dir, region["id"] + suffix)
+        write_region(path, g, sel, degree, speed)
         print(f"{region['id']}: {len(sel)} edges, {os.path.getsize(path) / 1e6:.1f} MB in {time.time() - t:.0f}s")
 
 
-def write_region(path, g, sel, degree):
+def write_region(path, g, sel, degree, speed):
     u_all, v_all = g["u"], g["v"]
     geom = g["geom"]
     nodes = np.unique(np.concatenate([u_all[sel], v_all[sel]]))
@@ -308,7 +410,7 @@ def write_region(path, g, sel, degree):
     np.cumsum(np.bincount(cell, minlength=rows * cols), out=grid_start[1:])
 
     header = np.zeros(16, dtype="<i4")
-    header[:12] = [MAGIC, VERSION, n, e, len(lat), len(border), cols, rows, min_lat, min_lon, CELL, len(cell_edge)]
+    header[:13] = [MAGIC, VERSION, n, e, len(lat), len(border), cols, rows, min_lat, min_lon, CELL, len(cell_edge), speed]
     with open(path, "wb") as f:
         for part in (
             header,
@@ -328,6 +430,8 @@ def write_region(path, g, sel, degree):
 def main():
     if sys.argv[1] == "build":
         build(*sys.argv[2:5])
+    elif sys.argv[1] == "build-driving":
+        build(*sys.argv[2:5], driving=True)
     elif sys.argv[1] == "cut":
         cut(*sys.argv[2:5])
     else:
