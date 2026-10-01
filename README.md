@@ -155,6 +155,15 @@ components of 50 edges or more): a one-way road into a car park whose way
 out is not mapped for cars would otherwise be a trap a route could start
 in and never get out of.
 
+For the app's directions, each edge also says what road it is: its number
+(`ref`, "A59"; several joined with " / "), its name, its kind (the
+`highway` value, or a ferry) and whether it is part of a roundabout
+(`junction=roundabout` or `circular`). These come after the file's last
+section, flagged in the header's first reserved word, so an app from
+before them reads the file as it always did; they add 6 to 8% to a
+driving graph (England 439 MB to 467 MB). Each region's file holds only
+the names its edges use.
+
 ## Sizes (September 2026 data)
 
 | | Tiles | Graph | Total |

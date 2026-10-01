@@ -25,6 +25,11 @@ lowered to its limit where that is lower). The file's header carries
 DRIVE_KMH, which is how the app turns a cost back into a time. The way a
 one-way road does not go costs infinity. Car ferries are in, at FERRY_KMH;
 turn restrictions are not.
+
+A driving graph also says what road each edge is, for the app's
+directions: its number and name ("A59", "Whalley Road"), its kind (ROAD
+below) and whether it is part of a roundabout. These follow the file's last
+section, where an app that does not read them never looks.
 """
 import json
 import os
@@ -83,6 +88,12 @@ BUFFER = 0.02
 MIN_COMPONENT_EDGES = 50
 MAGIC = 0x52474D4D  # "MMGR"
 VERSION = 1
+# A driving graph's roads: the kinds, numbered as the app's Graph.kt numbers
+# them (0 for none), and the bit that marks a roundabout.
+ROAD = ("", "motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link",
+        "secondary", "secondary_link", "tertiary", "tertiary_link", "unclassified", "road",
+        "residential", "living_street", "service", "ferry")
+ROUNDABOUT = 0x20
 
 
 def walk(tags):
@@ -152,6 +163,23 @@ def drive(tags):
     return f, f
 
 
+def road_label(tags):
+    """A road's number and name, one line each ("A59\nWhalley Road"); "" for neither."""
+    ref = " / ".join(r.strip() for r in (tags.get("ref") or "").split(";") if r.strip())
+    name = (tags.get("name") or "").strip()
+    if not ref and not name:
+        return ""
+    return ref.replace("\n", " ") + "\n" + name.replace("\n", " ")
+
+
+def road_kind(tags):
+    """A road's kind (an index into ROAD), and ROUNDABOUT if it is part of one."""
+    kind = ROAD.index("ferry") if tags.get("route") == "ferry" else ROAD.index(tags.get("highway"))
+    if tags.get("junction") in ("roundabout", "circular"):
+        kind |= ROUNDABOUT
+    return kind
+
+
 def elevation(dem, lat_e7, lon_e7):
     """Heights in decimetres, bilinear from the OS Terrain 50 grid."""
     import pyproj
@@ -193,6 +221,9 @@ def build(pbf, dem_path, out, driving=False):
     t = time.time()
     refs, xs, ys = array("q"), array("i"), array("i")
     starts, forward, backward = array("q", [0]), array("f"), array("f")
+    # Driving: each way's road, its label an index into labels.
+    labels = {"": 0}
+    way_label, way_kind = array("i"), array("b")
     keys = ("highway", "route") if driving else ("highway",)
     profile = drive if driving else walk
     climb = 0.0 if driving else CLIMB
@@ -222,6 +253,9 @@ def build(pbf, dem_path, out, driving=False):
         starts.append(len(refs))
         forward.append(f[0])
         backward.append(f[1])
+        if driving:
+            way_label.append(labels.setdefault(road_label(w.tags), len(labels)))
+            way_kind.append(road_kind(w.tags))
     refs = np.frombuffer(refs, dtype=np.int64)
     lon = np.frombuffer(xs, dtype=np.int32)
     lat = np.frombuffer(ys, dtype=np.int32)
@@ -301,12 +335,27 @@ def build(pbf, dem_path, out, driving=False):
     s_ele = elevation(dem, s_lat, s_lon)
     print(f"{len(node_lat)} nodes, {len(g_lat)} -> {len(s_lat)} points in {time.time() - t:.0f}s")
 
+    roads = {}
+    if driving:
+        way_of_edge = way_of[:-1][pair]
+        text = [label.encode() for label in sorted(labels, key=labels.get)]
+        label_start = np.zeros(len(text) + 1, dtype=np.int64)
+        np.cumsum([len(t) for t in text], out=label_start[1:])
+        roads = dict(
+            label=np.frombuffer(way_label, dtype=np.int32)[way_of_edge],
+            kind=np.frombuffer(way_kind, dtype=np.int8)[way_of_edge],
+            label_bytes=np.frombuffer(b"".join(text), dtype=np.uint8),
+            label_start=label_start,
+        )
+        print(f"{len(text)} road names and numbers")
+
     np.savez(
         out,
         node_lat=node_lat, node_lon=node_lon,
         u=u, v=v, length=length, cost_f=cost_f, cost_b=cost_b,
         geom=s_offs, lat=s_lat, lon=s_lon, ele=s_ele,
         speed=np.int32(DRIVE_KMH if driving else 0),
+        **roads,
     )
 
 
@@ -411,6 +460,20 @@ def write_region(path, g, sel, degree, speed):
 
     header = np.zeros(16, dtype="<i4")
     header[:13] = [MAGIC, VERSION, n, e, len(lat), len(border), cols, rows, min_lat, min_lon, CELL, len(cell_edge), speed]
+
+    # The roads, with the labels this region's edges use, renumbered: label
+    # 0, no number and no name, stays 0.
+    roads = ()
+    if "label" in g.files:
+        used, local = np.unique(np.concatenate([[0], g["label"][sel]]), return_inverse=True)
+        road = local[1:].astype(np.int64) | (g["kind"][sel].astype(np.int64) << 24)
+        label_start = g["label_start"]
+        lengths = label_start[used + 1] - label_start[used]
+        starts = np.zeros(len(used) + 1, dtype=np.int64)
+        np.cumsum(lengths, out=starts[1:])
+        text = g["label_bytes"][np.arange(starts[-1]) - np.repeat(starts[:-1] - label_start[used], lengths)]
+        header[13:16] = [1, len(used), len(text)]
+        roads = (road.astype("<i4"), starts.astype("<i4"), text.astype(np.uint8), np.zeros(-len(text) % 4, dtype=np.uint8))
     with open(path, "wb") as f:
         for part in (
             header,
@@ -423,6 +486,7 @@ def write_region(path, g, sel, degree, speed):
             ele.astype("<i2"), np.zeros(len(ele) % 2, dtype="<i2"),
             border.astype("<i4"),
             grid_start.astype("<i4"), cell_edge.astype("<i4"),
+            *roads,
         ):
             f.write(part.tobytes())
 
