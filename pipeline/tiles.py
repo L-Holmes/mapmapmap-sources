@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Vector tile files: merge the two Planetiler outputs, and cut regions.
+Tile files: merge the two Planetiler outputs, and cut regions.
 
     tiles.py merge <omt.mbtiles> <hiking.mbtiles> <out.mbtiles>
     tiles.py cut <merged.mbtiles> <regions.json> <out dir> [overview.mbtiles]
+    tiles.py cut-as <kind> <tiles.mbtiles> <regions.json> <out dir>
 
 merge puts both sets of layers in each tile. A vector tile is a protobuf
 whose layers are a repeated field, so two tiles' bytes, decompressed and
@@ -15,6 +16,9 @@ same merged file, so where two overlap their tiles are identical and the
 app can draw both without a seam. With an overview path, it also writes
 the z0-z7 tiles, which the app ships: the low zooms, everywhere, before
 anything is downloaded.
+
+cut-as does the same with other tiles, as <out dir>/<region>.<kind>: the
+relief's raster tiles (pipeline/relief.py), shade.mbtiles and slope.mbtiles.
 
 Output files use the deduplicated layout Planetiler writes (tiles_shallow,
 tiles_data and a tiles view): the sea is one tile stored once.
@@ -196,7 +200,7 @@ def copy_tiles(src_path, out_path, keys, meta):
     return count
 
 
-def cut(src_path, regions_path, out_dir, overview_path=None):
+def cut(src_path, regions_path, out_dir, overview_path=None, kind="mbtiles"):
     from shapely.geometry import shape
     os.makedirs(out_dir, exist_ok=True)
     src = sqlite3.connect(src_path)
@@ -208,7 +212,7 @@ def cut(src_path, regions_path, out_dir, overview_path=None):
         print(f"overview: {n} tiles, {os.path.getsize(overview_path) / 1e6:.1f} MB")
     for region in json.load(open(regions_path)):
         t = time.time()
-        path = os.path.join(out_dir, region["id"] + ".mbtiles")
+        path = os.path.join(out_dir, f"{region['id']}.{kind}")
         area = shape(region["geometry"]).buffer(BUFFER)
         if region["parent"] is None:
             keys = [(z, x, y) for z, x, y in src.execute(
@@ -236,6 +240,8 @@ def main():
         merge(*sys.argv[2:5])
     elif sys.argv[1] == "cut":
         cut(*sys.argv[2:6])
+    elif sys.argv[1] == "cut-as":
+        cut(*sys.argv[3:6], kind=sys.argv[2])
     else:
         sys.exit(__doc__)
 

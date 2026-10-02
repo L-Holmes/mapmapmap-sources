@@ -11,6 +11,7 @@ import com.onthegomap.planetiler.reader.osm.OsmRelationInfo;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * The layers a hiking map needs that OpenMapTiles does not carry, built into
@@ -26,6 +27,14 @@ import java.util.Set;
  *                 nwn, rwn or lwn, with the route's name and ref.
  *   contour       10 m contours from OS Terrain 50 (pipeline/terrain.py), "idx"
  *                 on every 50 m.
+ *   feature       named places a walk is named after that OpenMapTiles
+ *                 leaves out: "class" waterfall (a point) or valley (a
+ *                 point, line or area, as mapped), and its "name". Not
+ *                 drawn; the app reads them to name a walk.
+ *   peak          every named peak, from zoom 10, with its "name" and "ele"
+ *                 (metres, a whole number, if it has one). OpenMapTiles'
+ *                 mountain_peak keeps only a few per patch below zoom 12,
+ *                 not the highest; the app labels these, the highest first.
  *
  *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --output=...
  */
@@ -34,6 +43,9 @@ public class Hiking implements Profile {
   record Route(long id, String network, String name, String ref) implements OsmRelationInfo {}
 
   static final Set<String> PATHS = Set.of("path", "footway", "bridleway", "track", "steps", "cycleway", "pedestrian");
+
+  /** An OSM height: "978", "978.4", "978 m", or in feet, "3209 ft" or "3209'". */
+  static final Pattern HEIGHT = Pattern.compile("\\s*(-?\\d+(?:\\.\\d+)?)\\s*(m|ft|feet|')?\\s*");
 
   @Override
   public List<OsmRelationInfo> preprocessOsmRelation(OsmElement.Relation rel) {
@@ -55,6 +67,34 @@ public class Hiking implements Profile {
         .setMinZoom(idx ? 11 : 13)
         .setMinPixelSize(0)
         .setPixelTolerance(0.4);
+      return;
+    }
+    String name = sf.getString("name");
+    if (name != null && sf.hasTag("waterway", "waterfall")) {
+      features.pointOnSurface("feature")
+        .setAttr("class", "waterfall")
+        .setAttr("name", name)
+        .setMinZoom(12);
+      return;
+    }
+    if (name != null && sf.isPoint() && sf.hasTag("natural", "peak", "volcano", "hill")) {
+      Integer ele = metres(sf.getString("ele"));
+      features.point("peak")
+        .setAttr("name", name)
+        .setAttr("ele", ele)
+        .setSortKey(ele == null ? 0 : -ele)
+        .setMinZoom(10);
+      return;
+    }
+    if (name != null && sf.hasTag("natural", "valley")) {
+      var valley = sf.isPoint() ? features.point("feature")
+        : sf.canBePolygon() ? features.polygon("feature")
+        : features.line("feature");
+      valley
+        .setAttr("class", "valley")
+        .setAttr("name", name)
+        .setMinZoom(12)
+        .setMinPixelSize(0);
       return;
     }
     if (!sf.canBeLine() || sf.canBePolygon() && sf.hasTag("area", "yes")) {
@@ -100,6 +140,21 @@ public class Hiking implements Profile {
     }
   }
 
+  static Integer metres(String ele) {
+    if (ele == null) {
+      return null;
+    }
+    var m = HEIGHT.matcher(ele);
+    if (!m.matches()) {
+      return null;
+    }
+    double value = Double.parseDouble(m.group(1));
+    if (m.group(2) != null && !m.group(2).equals("m")) {
+      value *= 0.3048;
+    }
+    return (int) Math.round(value);
+  }
+
   static String rightOfWay(String designation) {
     if (designation == null) {
       return null;
@@ -137,6 +192,9 @@ public class Hiking implements Profile {
   @Override
   public List<VectorTile.Feature> postProcessLayerFeatures(String layer, int zoom, List<VectorTile.Feature> items)
     throws GeometryException {
+    if (layer.equals("feature") || layer.equals("peak")) {
+      return items;
+    }
     // Join the pieces of each line that share their attributes, so dashes
     // and labels run on across way boundaries.
     return FeatureMerge.mergeLineStrings(items, 0.5, 0.25, 4);

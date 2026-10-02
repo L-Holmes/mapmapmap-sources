@@ -31,7 +31,7 @@ lock
 SRC=data/src WORK=data/work OUT=data/out
 PY=data/.venv/bin/python
 mkdir -p "$SRC" "$WORK" "$OUT"
-STEPS=10
+STEPS=11
 
 # --- Tools ---------------------------------------------------------------------
 
@@ -40,8 +40,9 @@ command -v java >/dev/null || { echo "error: needs Java 21 or newer" >&2; exit 1
 command -v uv >/dev/null || { echo "error: needs uv (https://docs.astral.sh/uv/)" >&2; exit 1; }
 if [[ ! -x "$PY" ]]; then
   uv venv -q data/.venv
-  VIRTUAL_ENV=data/.venv uv pip install -q numpy scipy shapely osmium contourpy pyproj pyshp
 fi
+# Every run, so a venv from before a package was needed gets it (quick when it has them all).
+VIRTUAL_ENV=data/.venv uv pip install -q numpy scipy shapely osmium contourpy pyproj pyshp pillow tifffile
 PLANETILER_VERSION=v0.10.2
 [[ -f "$SRC/planetiler.jar" ]] || curl -fL --progress-bar -o "$SRC/planetiler.jar" \
   "https://github.com/onthegomap/planetiler/releases/download/$PLANETILER_VERSION/planetiler.jar"
@@ -132,15 +133,22 @@ $PY pipeline/tiles.py merge "$WORK/omt.mbtiles" "$WORK/hiking.mbtiles" "$WORK/me
 # The z0-7 overview the app ships, published beside the regions.
 $PY pipeline/tiles.py cut "$WORK/merged.mbtiles" "$WORK/regions.json" "$OUT" "$OUT/overview.mbtiles"
 
-step 8 $STEPS "Walking graph" "about 20 minutes"
+step 8 $STEPS "Relief: hill shading and steep ground" "20 minutes; half an hour more the first time, fetching England's LIDAR (6 GB)"
+# 20 m heights: the Environment Agency's LIDAR in England, Terrain 50 elsewhere.
+$PY -u pipeline/lidar.py "$WORK/regions.json" "$WORK/terrain/dem.npy" "$SRC/lidar" "$WORK/terrain/heights.npy"
+$PY -u pipeline/relief.py "$WORK/terrain/heights.npy" "$WORK/shade.mbtiles" "$WORK/slope.mbtiles" "$BOUNDS"
+$PY pipeline/tiles.py cut-as shade.mbtiles "$WORK/shade.mbtiles" "$WORK/regions.json" "$OUT"
+$PY pipeline/tiles.py cut-as slope.mbtiles "$WORK/slope.mbtiles" "$WORK/regions.json" "$OUT"
+
+step 9 $STEPS "Walking graph" "about 20 minutes"
 $PY -u pipeline/graph.py build "$SRC/united-kingdom.osm.pbf" "$WORK/terrain/dem.npy" "$WORK/graph.npz"
 $PY -u pipeline/graph.py cut "$WORK/graph.npz" "$WORK/regions.json" "$OUT"
 
-step 9 $STEPS "Driving graph" "about 15 minutes"
+step 10 $STEPS "Driving graph" "about 15 minutes"
 $PY -u pipeline/graph.py build-driving "$SRC/united-kingdom.osm.pbf" "$WORK/terrain/dem.npy" "$WORK/driving.npz"
 $PY -u pipeline/graph.py cut "$WORK/driving.npz" "$WORK/regions.json" "$OUT"
 
-step 10 $STEPS "Catalogue: sizes and checksums" "under a minute"
+step 11 $STEPS "Catalogue: sizes and checksums" "under a minute"
 $PY pipeline/catalog.py "$WORK/regions.json" "$OUT" "$VERSION"
 
 echo

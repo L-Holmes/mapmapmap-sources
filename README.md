@@ -14,14 +14,16 @@ https://github.com/L-Holmes/mapmapmap-sources/releases/latest/download/catalog.j
 | File | What it is |
 | --- | --- |
 | `catalog.json` | Every region's files, with sizes and SHA-256, the data's date, and the format version |
-| `<region>.mbtiles` | Vector map tiles, zooms 8 to 14: roads, paths, public rights of way, waymarked routes, 10 m contours, land and water |
+| `<region>.mbtiles` | Vector map tiles, zooms 8 to 14: roads, paths, public rights of way, waymarked routes, 10 m contours, land and water, and named waterfalls and valleys (for the app to name walks by) |
 | `<region>.graph` | The walking graph the app plans routes on |
 | `<region>.driving.graph` | The driving graph the app plans car routes on |
+| `<region>.shade.mbtiles`, `<region>.slope.mbtiles` | The hiking map's relief, raster tiles: hill shading (zooms 8 to 12), and steep ground in bands from 25° (zooms 8 to 14); from the Environment Agency's LIDAR in England, OS Terrain 50 elsewhere |
 | `overview.mbtiles`, `app-regions.json` | What the app ships inside itself: zooms 0 to 7 everywhere, and the region outlines. The app repository's `tools/refresh-assets.sh` copies them in. |
 
 Regions: all of Great Britain, England, Scotland, Wales, and England's 47
 counties (Geofabrik's boundaries). A county is typically 50 to 90 MB; all of
-Great Britain is 3.2 GB.
+Great Britain is 3.2 GB. The relief adds 5 to 30 MB a county (Lancashire 10,
+Cumbria 27), and an estimated 500 to 700 MB to all of Great Britain.
 
 ## Updating the maps
 
@@ -50,9 +52,13 @@ Monthly is plenty. It needs, on the machine that runs it:
 - Java 21 or newer, and [uv](https://docs.astral.sh/uv/) (Python packages
   install themselves into `data/.venv` the first time)
 - the GitHub CLI, `gh`, logged in once with `gh auth login`
-- ~40 GB of disk and ~24 GB of RAM
+- ~55 GB of disk and ~24 GB of RAM
 
-Everything it downloads and builds stays in `data/` (gitignored).
+Everything it downloads and builds stays in `data/` (gitignored). The first
+run also fetches the Environment Agency's LIDAR for England (about half an
+hour; kept in `data/src/lidar`, so later runs fetch only squares that
+failed). The relief's 20 m height grid and what is worked out from it take
+about 10 GB of `data/work`.
 `pipeline/build.sh` and `pipeline/publish.sh` are its two halves, to run
 separately if wanted (`pipeline/build.sh --download-only` just fetches the
 data). `pipeline/serve.sh` serves `data/out` to a

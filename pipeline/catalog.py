@@ -13,7 +13,11 @@ import json
 import os
 import sys
 
-KINDS = ("mbtiles", "graph", "driving.graph")
+# A region on a phone that lacks one is offered it as an update, which
+# fetches just that. An app from before a kind fetches it too, and leaves it
+# unused (the relief, raster tiles of hill shading and of steep ground,
+# came after the rest).
+KINDS = ("mbtiles", "graph", "driving.graph", "shade.mbtiles", "slope.mbtiles")
 # What an app needs to understand these files: the tiles' layers and the
 # graph's binary layout. Raise it when either changes in a way an installed
 # app cannot read; apps built for an older format then leave the new files
