@@ -13,7 +13,7 @@ https://github.com/L-Holmes/mapmapmap-sources/releases/latest/download/catalog.j
 
 | File | What it is |
 | --- | --- |
-| `catalog.json` | Every region's files, with sizes and SHA-256, the data's date, and the format version |
+| `catalog.json` | Every region's files, with sizes and SHA-256, the version (the data's date and the pipeline's revision), and the format |
 | `<region>.mbtiles` | Vector map tiles, zooms 8 to 14: roads, paths, public rights of way, waymarked routes, 10 m contours, land and water, and named waterfalls and valleys (for the app to name walks by) |
 | `<region>.graph` | The walking graph the app plans routes on |
 | `<region>.driving.graph` | The driving graph the app plans car routes on |
@@ -33,12 +33,15 @@ Cumbria 27), and an estimated 500 to 700 MB to all of Great Britain.
 
 That is the whole job. In order, it:
 
-1. finishes an upload that stopped partway, if there is one;
-2. checks whether OpenStreetMap has newer data than what is published, and
-   stops there if not (`--force` rebuilds anyway);
-3. downloads the newest data and rebuilds every region (about an hour);
-4. publishes them here as a new release (about 50 minutes for ~8.5 GB at
-   3 MB/s).
+1. finishes an upload that stopped partway, if there is one, and stops
+   there: the maps are out (run it again for anything newer);
+2. checks whether OpenStreetMap has newer data than what is published, or
+   the pipeline has changed since, and stops there if neither (`--force`
+   rebuilds anyway);
+3. downloads the newest data and rebuilds every region (about two hours,
+   half an hour more the first time, for England's LIDAR);
+4. publishes them here as a new release (~12 GB: about an hour at 3 MB/s,
+   four on a slow line; four files go up at a time).
 
 Each step says what it is doing, how long it usually takes and how long the
 run has taken so far; downloads and uploads show their progress. Only one
@@ -74,9 +77,15 @@ USB-attached phone, to try a build before publishing it.
   a release is published: GitHub answers them with a redirect to the newest
   published release's file, and with 404 while there is none. There is no
   page at `releases/latest/download/` itself.
-- The catalogue's `version` is the OSM data's date. An installed region
-  older than it is offered its update; the old files stay in use until the
-  new ones are in and checked.
+- The catalogue's `version` is the OSM data's date and the pipeline's
+  revision, a hash of the scripts that shape what is built
+  (`pipeline/common.sh`), as in `2026-09-30.b4ed3ea`. So changing the
+  pipeline makes a new version even with no newer data, and
+  `update-maps.sh` builds and publishes it. An installed region of another
+  version is offered its update, which fetches only the files whose
+  SHA-256 differs from those it came with (an app from before it kept them
+  fetches all of them, once); the old files stay in use until the new ones
+  are in and checked.
 - The release before the newest is kept, so a download already under way
   finishes; older ones are deleted. Publishing the same data twice replaces
   its release.
@@ -106,6 +115,8 @@ countries, and England's 47 counties.
 | --- | --- |
 | `pipeline/regions.py` | The 51 regions and their outlines from Geofabrik's index: in full for cutting, and simplified for the app (`app-regions.json`), which is how it tells which region you are in with no signal. |
 | `pipeline/terrain.py` | OS Terrain 50 as one 1.4 GB height grid (`dem.npy`), and 10 m contours, traced with contourpy and written as shapefiles in WGS84. |
+| `pipeline/lidar.py` | A 20 m height grid for the relief (`heights.npy`): the Environment Agency's LIDAR Composite DTM in England, fetched from its WCS at 10 m in 10 km squares (cached in `data/src/lidar`), OS Terrain 50 elsewhere, blended where they meet. |
+| `pipeline/relief.py` | The relief's raster tiles from it: hill shading (`shade.mbtiles`, zooms 8 to 12) and steep ground in bands from 25° (`slope.mbtiles`, zooms 8 to 14; the zooms below keep the steepest pixel, so it shows zoomed out). |
 | Planetiler, OpenMapTiles profile | The base map: land, water, roads, places, peaks, to z14. |
 | `pipeline/hiking/Hiking.java` | A Planetiler profile of our own for what OpenMapTiles leaves out: every path with its UK right of way (`row`), SAC difficulty, faint or private access; waymarked routes from route relations; the contours. |
 | `pipeline/tiles.py merge` | Both tile sets in one file. A vector tile's layers are a repeated protobuf field, so two tiles' bytes, concatenated, are one tile with both sets of layers. |
@@ -113,7 +124,7 @@ countries, and England's 47 counties.
 | `pipeline/graph.py build` | The walking graph for all of Great Britain: walkable ways split at junctions, each edge costed both ways. |
 | `pipeline/graph.py build-driving` | The driving graph for all of Great Britain: roads cars may use, and car ferries, costed by speed each way. |
 | `pipeline/graph.py cut` | Each region's graph, in the app's binary format (documented in the app's `routing/Graph.kt`). Networks of under 50 edges, mapped without joining anything, are dropped: snapping to one would strand a route. |
-| `pipeline/catalog.py` | `catalog.json`: each region's files, sizes and SHA-256, and the version (the OSM data's date). |
+| `pipeline/catalog.py` | `catalog.json`: each region's files, sizes and SHA-256, and the version (the OSM data's date and the pipeline's revision). |
 
 ### The walking graph
 
@@ -188,5 +199,7 @@ the names its edges use.
   here under the same licence.
 - Contains OS data © Crown copyright and database right (OS Terrain 50,
   [Open Government Licence](https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/)).
+- Contains Environment Agency LIDAR data © Environment Agency copyright
+  and/or database right (LIDAR Composite DTM, Open Government Licence).
 - Tiles follow the [OpenMapTiles](https://openmaptiles.org/schema/) schema
   (CC BY 4.0), built with [Planetiler](https://github.com/onthegomap/planetiler).

@@ -28,6 +28,7 @@ source pipeline/common.sh
 lock
 OUT=data/out
 KEEP=2
+PARALLEL=4
 command -v gh >/dev/null || { echo "error: needs the GitHub CLI (gh); see README.md" >&2; exit 1; }
 gh auth status >/dev/null 2>&1 || { echo "error: gh is not logged in; run: gh auth login" >&2; exit 1; }
 [[ -f "$OUT/catalog.json" ]] || { echo "error: no $OUT/catalog.json; run pipeline/build.sh" >&2; exit 1; }
@@ -63,11 +64,11 @@ echo "==> Release $TAG on $REPO: ${#FILES[@]} files, $(du -shc "${FILES[@]}" | t
 if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   # Made as a draft and only published once every file is up, so no app
   # ever sees a catalogue whose files are still uploading.
-  NOTES="Map data for Great Britain from OpenStreetMap, $VERSION, and OS Terrain 50.
+  NOTES="Map data for Great Britain from OpenStreetMap, OS Terrain 50 and the Environment Agency's LIDAR; version $VERSION (the data's date, and the pipeline's revision).
 
 Each region is five files: \`<region>.mbtiles\` (vector map tiles), \`<region>.graph\` (the walking graph the app routes on), \`<region>.driving.graph\` (the driving graph), and \`<region>.shade.mbtiles\` and \`<region>.slope.mbtiles\` (raster tiles of hill shading, and of steep ground). \`catalog.json\` lists them with their sizes and SHA-256. \`overview.mbtiles\` and \`app-regions.json\` are what the app ships inside itself.
 
-© OpenStreetMap contributors, available under the Open Database Licence. Contains OS data © Crown copyright and database right."
+© OpenStreetMap contributors, available under the Open Database Licence. Contains OS data © Crown copyright and database right. Contains Environment Agency LIDAR data © Environment Agency copyright and/or database right, under the Open Government Licence v3.0."
   gh release create "$TAG" --repo "$REPO" --draft --title "Maps $VERSION" --notes "$NOTES"
 fi
 
@@ -80,11 +81,22 @@ for f in "${FILES[@]}"; do
   TODO+=("$f")
   LEFT=$((LEFT + size))
 done
-echo "    ${#TODO[@]} files to upload, $((LEFT / 1000000)) MB"
+echo "    ${#TODO[@]} files to upload, $((LEFT / 1000000)) MB, $PARALLEL at a time"
+# Several at once: GitHub gives one upload a fraction of what the line can
+# do. The next starts as soon as any finishes; one that fails stops the run
+# (run it again to carry on). How far along it is counts the files finished.
 DONE=0
 BEGAN=$SECONDS
+declare -A RUNNING=()  # upload's pid -> its file's size
+finish_one() {
+  local pid
+  wait -n -p pid "${!RUNNING[@]}"
+  DONE=$((DONE + RUNNING[$pid]))
+  unset "RUNNING[$pid]"
+}
 for i in "${!TODO[@]}"; do
   f=${TODO[$i]}
+  while (( ${#RUNNING[@]} >= PARALLEL )); do finish_one; done
   size=$(stat -c %s "$f")
   took=$((SECONDS - BEGAN))
   if (( DONE > 0 && took > 0 )); then
@@ -95,9 +107,10 @@ for i in "${!TODO[@]}"; do
   fi
   printf '    [%d/%d] %s, %d MB  (%d of %d MB done, %s)\n' $((i + 1)) ${#TODO[@]} "$(basename "$f")" \
     $((size / 1000000)) $((DONE / 1000000)) $((LEFT / 1000000)) "$rate"
-  gh release upload "$TAG" "$f" --repo "$REPO" --clobber
-  DONE=$((DONE + size))
+  gh release upload "$TAG" "$f" --repo "$REPO" --clobber &
+  RUNNING[$!]=$size
 done
+while (( ${#RUNNING[@]} > 0 )); do finish_one; done
 gh release edit "$TAG" --repo "$REPO" --draft=false --latest
 
 echo "==> Keeping the newest $KEEP releases"

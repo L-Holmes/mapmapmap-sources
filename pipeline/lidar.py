@@ -47,6 +47,10 @@ from shapely.ops import transform
 
 WCS = "https://environment.data.gov.uk/spatialdata/lidar-composite-digital-terrain-model-dtm-2m/wcs"
 COVERAGE = "09ea3b37-df3a-4e8b-ac69-fb0842227b04__Lidar_Composite_Elevation_DTM_2m"
+# The coverage's extent, OSGB west, south, east, north (its DescribeCoverage).
+# Asked for anything past it, the service answers 500; asked for a square
+# across its edge, only the part inside.
+EXTENT = (80_000, 4_000, 656_000, 665_000)
 SQUARE = 10_000
 FETCHED = 10
 FETCHED_SCALE = 2 / FETCHED  # the service's 2 m cells to ours
@@ -56,7 +60,10 @@ COLS, ROWS = 700_000 // CELL, 1_300_000 // CELL
 TERRAIN_CELL = 50
 NODATA = -32768
 BLEND = 10  # cells either side: 200 m
-WORKERS = 6
+WORKERS = 8
+# Nothing in Terrain 50 above this (metres) is sea: its tiles have the sea
+# at about -1.7, and where it has no tile, pipeline/terrain.py puts -2.5.
+SEA = 0.0
 
 logging.getLogger("tifffile").setLevel(logging.ERROR)
 
@@ -75,28 +82,45 @@ def path_of(cache, e, n):
     return os.path.join(cache, f"{e // 1000:03d}_{n // 1000:04d}.npz")
 
 
-def fetch(cache, e, n):
-    """Fetches one square into the cache; True if it is there now."""
+def fetch(cache, e, n, dem):
+    """
+    Fetches one square into the cache; True if it is there now. The service
+    refuses (500) a square inside its extent that it holds nothing of,
+    which is the open sea: where Terrain 50 [dem] has only sea, a refusal
+    is taken as that, and kept as an empty square, not tried again.
+    """
     path = path_of(cache, e, n)
     if os.path.exists(path):
         return True
-    url = (f"{WCS}?service=WCS&version=2.0.1&request=GetCoverage&coverageId={COVERAGE}&format=image/tiff"
-           f"&subset=E({e},{e + SQUARE})&subset=N({n},{n + SQUARE})&SCALEFACTOR={FETCHED_SCALE}")
-    for attempt in range(5):
-        try:
-            with urllib.request.urlopen(url, timeout=300) as r:
-                heights = tifffile.imread(io.BytesIO(r.read())).astype(np.float32)
-            if heights.shape != (PIXELS, PIXELS):
-                raise ValueError(f"shape {heights.shape}")
-            break
-        except Exception as ex:  # noqa: BLE001 - a network or server hiccup: try again, then leave it
-            if attempt == 4:
-                print(f"\n    {e},{n}: {ex}; Terrain 50 there for now")
-                return False
-            time.sleep(5 * 2 ** attempt)
+    sea = float(np.asarray(dem[n // TERRAIN_CELL:(n + SQUARE) // TERRAIN_CELL, e // TERRAIN_CELL:(e + SQUARE) // TERRAIN_CELL]).max()) <= SEA
+    # Only the part inside the coverage is asked for; the rest is no data.
+    heights = np.full((PIXELS, PIXELS), np.nan, np.float32)
+    w, s, ea, no = max(e, EXTENT[0]), max(n, EXTENT[1]), min(e + SQUARE, EXTENT[2]), min(n + SQUARE, EXTENT[3])
+    if w < ea and s < no:
+        url = (f"{WCS}?service=WCS&version=2.0.1&request=GetCoverage&coverageId={COVERAGE}&format=image/tiff"
+               f"&subset=E({w},{ea})&subset=N({s},{no})&SCALEFACTOR={FETCHED_SCALE}")
+        want = ((no - s) // FETCHED, (ea - w) // FETCHED)
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(url, timeout=300) as r:
+                    got = tifffile.imread(io.BytesIO(r.read())).astype(np.float32)
+                if got.shape != want:
+                    raise ValueError(f"shape {got.shape}, not {want}")
+                break
+            except Exception as ex:  # noqa: BLE001 - a network or server hiccup: try again, then leave it
+                if sea and getattr(ex, "code", None) == 500:
+                    got = np.full(want, np.nan, np.float32)
+                    break
+                if attempt == 4:
+                    print(f"\n    {e},{n}: {ex}; Terrain 50 there for now")
+                    return False
+                time.sleep(5 * 2 ** attempt)
+        # The service's row 0 is the north.
+        top, left = (n + SQUARE - no) // FETCHED, (w - e) // FETCHED
+        heights[top:top + want[0], left:left + want[1]] = got
     bad = ~np.isfinite(heights) | (heights < -1000)
-    # The service's row 0 is the north; the grid's is the south.
-    dm = np.where(bad, NODATA, np.round(heights * 10)).astype(np.int16)[::-1]
+    # The grid's row 0 is the south.
+    dm = np.where(bad, NODATA, np.round(np.where(bad, 0, heights) * 10)).astype(np.int16)[::-1]
     part = path[:-4] + ".part.npz"
     np.savez_compressed(part, dm=dm)
     os.replace(part, path)
@@ -104,14 +128,14 @@ def fetch(cache, e, n):
 
 
 
-def fetch_all(cache, wanted):
+def fetch_all(cache, wanted, dem):
     os.makedirs(cache, exist_ok=True)
     todo = [sq for sq in wanted if not os.path.exists(path_of(cache, *sq))]
     print(f"    {len(wanted)} squares, {len(wanted) - len(todo)} already here, fetching {len(todo)}")
     done = failed = 0
     start = time.time()
     with ThreadPoolExecutor(WORKERS) as pool:
-        for f in as_completed([pool.submit(fetch, cache, e, n) for e, n in todo]):
+        for f in as_completed([pool.submit(fetch, cache, e, n, dem) for e, n in todo]):
             done += 1
             failed += 0 if f.result() else 1
             left = (time.time() - start) / done * (len(todo) - done)
@@ -190,7 +214,7 @@ def build(dem_path, cache, out_path):
 def main():
     regions_path, dem_path, cache, out_path = sys.argv[1:5]
     ids = sys.argv[5:] or ["england"]
-    fetch_all(cache, squares(regions_path, ids))
+    fetch_all(cache, squares(regions_path, ids), np.load(dem_path, mmap_mode="r"))
     build(dem_path, cache, out_path)
 
 

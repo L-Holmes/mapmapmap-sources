@@ -88,13 +88,14 @@ if [[ ! -f "$SRC/terr50_gagg_gb.zip" ]]; then
   mv "$SRC/terr50_gagg_gb.zip.part" "$SRC/terr50_gagg_gb.zip"
 fi
 
-# The OSM data's own date is the release's version.
-VERSION=$($PY -c "
+# The release's version: the OSM data's own date, and the pipeline's revision.
+DATA=$($PY -c "
 import osmium, sys
 r = osmium.io.Reader(sys.argv[1], osmium.osm.osm_entity_bits.NOTHING)
 print(r.header().get('osmosis_replication_timestamp')[:10])
 r.close()" "$SRC/united-kingdom.osm.pbf")
-echo "    map data from $VERSION"
+VERSION="$DATA.$(revision)"
+echo "    map data from $DATA; this build is version $VERSION"
 if [[ "$ONLY_DOWNLOAD" -eq 1 ]]; then
   echo "==> Downloaded; built nothing (--download-only)"
   exit 0
@@ -152,4 +153,4 @@ step 11 $STEPS "Catalogue: sizes and checksums" "under a minute"
 $PY pipeline/catalog.py "$WORK/regions.json" "$OUT" "$VERSION"
 
 echo
-echo "==> Built: $(du -sh "$OUT" | cut -f1) in $OUT, map data from $VERSION, in $(elapsed)"
+echo "==> Built: $(du -sh "$OUT" | cut -f1) in $OUT, version $VERSION (map data from $DATA), in $(elapsed)"

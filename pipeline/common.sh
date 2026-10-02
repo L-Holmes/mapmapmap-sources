@@ -21,6 +21,14 @@ lock() {
   export MAPS_LOCK_HELD=1
 }
 
+# The pipeline's revision: the parts of it that shape the files built,
+# hashed. It is in the published version, after the map data's date, so a
+# change to the pipeline is a new version: update-maps.sh rebuilds for it
+# even when OpenStreetMap has nothing newer, and apps offer it as an update.
+revision() {
+  cat $(ls pipeline/build.sh pipeline/*.py pipeline/hiking/*.java | sort) | sha256sum | cut -c1-7
+}
+
 elapsed() {
   local s=$((SECONDS - STARTED))
   printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))

@@ -33,8 +33,8 @@ Then the tiles, each pixel taking the cells round it, bilinearly:
 
 Flat ground is neither, so the map shows through. The app draws both
 larger above their top zoom. The zooms below are their children averaged,
-four pixels to one. A tile with nothing on it (the sea, the flat) is left
-out.
+four pixels to one (the slope's, the steepest of the four). A tile with
+nothing on it (the sea, the flat) is left out.
 
 WebP, colour lossy, alpha exact.
 """
@@ -230,17 +230,31 @@ def encode(tile):
     return out.getvalue()
 
 
-def shrink(kids):
-    """Four tiles (top left, top right, bottom left, bottom right; None for empty) as their parent, or None."""
+def shrink(kids, steepest=False):
+    """
+    Four tiles (top left, top right, bottom left, bottom right; None for
+    empty) as their parent, or None: each pixel the four under it averaged,
+    or, [steepest], the most opaque of them, which for the slope is the
+    steepest. Averaged, a crag a pixel wide fades to nothing a zoom or two
+    out; this way steep ground still shows with the whole Lake District on
+    the screen.
+    """
     if all(k is None for k in kids):
         return None
     blank = np.zeros((SIZE, SIZE, 4), np.float32)
     k = [blank if t is None else t.astype(np.float32) for t in kids]
-    t = np.vstack([np.hstack(k[:2]), np.hstack(k[2:])]).reshape(SIZE, 2, SIZE, 2, 4).mean(axis=(1, 3))
+    big = np.vstack([np.hstack(k[:2]), np.hstack(k[2:])]).reshape(SIZE, 2, SIZE, 2, 4)
+    if steepest:
+        four = big.transpose(0, 2, 1, 3, 4).reshape(SIZE, SIZE, 4, 4)
+        pick = four[..., 3].argmax(axis=2)[..., None, None]
+        t = np.take_along_axis(four, pick, axis=2)[:, :, 0, :]
+    else:
+        t = big.mean(axis=(1, 3))
     return t if t[..., 3].max() >= 1 / 255 else None
 
 
-KINDS = {"shade": (shade, SHADE_TOP), "slope": (slope, SLOPE_TOP)}
+# Each kind: how a tile is made, its top zoom, and whether the zooms below keep the steepest pixel.
+KINDS = {"shade": (shade, SHADE_TOP, False), "slope": (slope, SLOPE_TOP, True)}
 
 
 def pyramid(job):
@@ -248,14 +262,14 @@ def pyramid(job):
     paths, x, y = job
     g = grids(*paths)
     out = {}
-    for kind, (render, top) in KINDS.items():
+    for kind, (render, top, steepest) in KINDS.items():
         tiles = []
 
         def tile(z, tx, ty):
             if z == top:
                 t = render(g, tx, ty)
             else:
-                t = shrink([tile(z + 1, 2 * tx + dx, 2 * ty + dy) for dy in (0, 1) for dx in (0, 1)])
+                t = shrink([tile(z + 1, 2 * tx + dx, 2 * ty + dy) for dy in (0, 1) for dx in (0, 1)], steepest)
             if t is not None:
                 tiles.append((z, tx, ty, encode(t)))
             return t
@@ -326,7 +340,7 @@ def main():
             parents = {(x // 2, y // 2) for x, y in level}
             level = {
                 (x, y): t for x, y in parents
-                if (t := shrink([level.get((2 * x + dx, 2 * y + dy)) for dy in (0, 1) for dx in (0, 1)])) is not None
+                if (t := shrink([level.get((2 * x + dx, 2 * y + dy)) for dy in (0, 1) for dx in (0, 1)], KINDS[kind][2])) is not None
             }
             for (x, y), t in level.items():
                 outputs[kind].store(z, x, y, encode(t))
