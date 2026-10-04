@@ -115,7 +115,8 @@ countries, and England's 47 counties.
 | `pipeline/terrain.py` | OS Terrain 50 as one 1.4 GB height grid (`dem.npy`), and 10 m contours, traced with contourpy and written as shapefiles in WGS84. |
 | `pipeline/lidar.py` | A 20 m height grid for the relief (`heights.npy`): the Environment Agency's LIDAR Composite DTM in England, fetched from its WCS at 10 m in 10 km squares (cached in `data/src/lidar`), OS Terrain 50 elsewhere, blended where they meet. |
 | `pipeline/relief.py` | The relief's raster tiles from it: hill shading (`shade.mbtiles`, zooms 8 to 12) and steep ground in bands from 25° (`slope.mbtiles`, zooms 8 to 14; the zooms below keep the steepest pixel, so it shows zoomed out). |
-| `pipeline/jut.py` | Each named peak's score, how impressively it rises above the paths and roads round it, and the place on one it rises most from (see below), for the hiking tiles' `jut` layer. |
+| `pipeline/jut.py` | Each named peak's scores, how impressively it rises above the paths and roads, the sea and the lakes round it, and the place it rises most from (see below), for the hiking tiles' `jut` layer. |
+| `pipeline/parking.py` | How far each car park is from the nearest path a walk would use (see below), for the app to leave out the car parks in town. |
 | Planetiler, OpenMapTiles profile | The base map: land, water, roads, places, peaks, to z14. |
 | `pipeline/hiking/Hiking.java` | A Planetiler profile of our own for what OpenMapTiles leaves out: every path with its UK right of way (`row`), SAC difficulty, faint or private access; waymarked routes from route relations; the contours; every named peak; and every car park the public may use, from zoom 10, with its spaces (mapped, or worked out from its area: see below), fee, and whether it is for customers only; and the peak scores `jut.py` works out. |
 | `pipeline/tiles.py merge` | Both tile sets in one file. A vector tile's layers are a repeated protobuf field, so two tiles' bytes, concatenated, are one tile with both sets of layers. |
@@ -141,17 +142,30 @@ multi-storey's footprint, 12 m² of an underground one's. Those carry
 (Great Britain's hiking tiles 478 MB to 503 MB; Lancashire 47.0 MB to
 47.7 MB).
 
+Each car park also has `path_m`, the metres to the nearest path a walk
+would use (`pipeline/parking.py`), and the app shows only those within
+500 m. Such a path is one walkers may use (not a pavement or a crossing)
+that is unpaved, a track or a bridleway, graded or faint; or, whatever it
+is made of, out of built-up land (`landuse` residential, retail,
+industrial and the like), in a park, a wood, a nature reserve, a common or
+open country, or along a canal. So the car parks at the start of a walk
+stay, and the supermarket's and the town centre's go.
+
 ### Peak scores
 
-How impressively each named peak rises above the paths and roads round
-it, and where from, which the app can draw as a dotted line from the
-summit to that place with the score by it. It starts from Kai Xu's
+How impressively each named peak rises above where someone can stand
+round it, and where from, which the app shows over the summit, with a
+dotted line to that place zoomed in. It starts from Kai Xu's
 [jut](https://peakjut.com/about): how impressively a summit P rises
 above a point Q is h·sin θ, h its height above Q's horizon and θ the
 angle Q looks up at it, at the Q that makes it most. Adjusted:
 
-- Q must be on a path or a road (any way in the walking or driving
-  graph, ferries aside), looked for within 10 km.
+- Q must be somewhere a person is, looked for within 10 km. There are
+  three scores, by where: a path or road (any way in the walking or
+  driving graph, ferries aside); the sea's edge, at sea level (the
+  coastline's sea, so sea lochs count); and a lake's edge, at its
+  water's height (lakes, ponds and reservoirs of a hectare or more; not
+  rivers or canals).
 - The steepness that counts is the climb's shape, not only its straight
   line: the distance each third of the height takes, the lowest third
   counted three times and the middle twice, as an angle. So ground rising
@@ -161,8 +175,11 @@ angle Q looks up at it, at the Q that makes it most. Adjusted:
   (steepness - 30°)))), ×1 on gentle ground, ×1.55 at 30°, to ×2.1.
 
 P is the summit (the highest 20 m cell within 40 m of the peak as
-mapped), on the relief's 20 m heights. `data/work/jut/jut.tsv` lists
-every peak's score with what went into it.
+mapped), on the relief's 20 m heights. Each score is ranked too: the
+highest within 5 km, and the highest in its county (England's counties
+as the regions have them; Scotland's council areas and Wales's principal
+areas), which the app draws bigger. `data/work/jut/jut.tsv` lists every
+score with what went into it. All three add about 2.4% to the tiles.
 
 ### The walking graph
 

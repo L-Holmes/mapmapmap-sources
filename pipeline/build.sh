@@ -31,7 +31,7 @@ lock
 SRC=data/src WORK=data/work OUT=data/out
 PY=data/.venv/bin/python
 mkdir -p "$SRC" "$WORK" "$OUT"
-STEPS=12
+STEPS=13
 
 # --- Tools ---------------------------------------------------------------------
 
@@ -81,6 +81,15 @@ else
   curl -fsSL -o "$SRC/index-v1.json" https://download.geofabrik.de/index-v1.json
 fi
 [[ -f "$SRC/index-v1.json" ]] || curl -fsSL -o "$SRC/index-v1.json" https://download.geofabrik.de/index-v1.json
+# The sea, as OpenStreetMap's coastline has it: Planetiler's for the base
+# map, and the peak scores' (before Planetiler would fetch it).
+if [[ ! -f "$SRC/sources/water-polygons-split-3857.zip" ]]; then
+  echo "    downloading the sea's polygons (900 MB)"
+  mkdir -p "$SRC/sources"
+  curl -fL --progress-bar -o "$SRC/sources/water-polygons-split-3857.zip.part" \
+    https://osmdata.openstreetmap.de/download/water-polygons-split-3857.zip
+  mv "$SRC/sources/water-polygons-split-3857.zip.part" "$SRC/sources/water-polygons-split-3857.zip"
+fi
 if [[ ! -f "$SRC/terr50_gagg_gb.zip" ]]; then
   echo "    downloading OS Terrain 50 (160 MB)"
   curl -fL --progress-bar -o "$SRC/terr50_gagg_gb.zip.part" \
@@ -136,25 +145,33 @@ step 7 $STEPS "Driving graph" "about 15 minutes"
 $PY -u pipeline/graph.py build-driving "$SRC/united-kingdom.osm.pbf" "$WORK/terrain/dem.npy" "$WORK/driving.npz"
 $PY -u pipeline/graph.py cut "$WORK/driving.npz" "$WORK/regions.json" "$OUT"
 
-step 8 $STEPS "Peak scores: how each peak rises above the paths and roads round it" "about 15 minutes"
-$PY -u pipeline/jut.py "$SRC/united-kingdom.osm.pbf" "$WORK/terrain/heights.npy" "$WORK/graph.npz" "$WORK/driving.npz" "$WORK/jut"
+step 8 $STEPS "Peak scores: how each peak rises above the paths, roads, sea and lakes round it" "about 10 minutes"
+$PY -u pipeline/jut.py "$SRC/united-kingdom.osm.pbf" "$SRC/sources/water-polygons-split-3857.zip" "$WORK/regions.json" \
+  "$WORK/terrain/heights.npy" "$WORK/graph.npz" "$WORK/driving.npz" "$WORK/jut"
 
-step 9 $STEPS "Base map tiles (Planetiler, OpenMapTiles)" "15 to 20 minutes"
+step 9 $STEPS "Car parks: how far each is from a path a walk would use" "about 10 minutes"
+mkdir -p "$WORK/parking"
+$PY -u pipeline/parking.py "$SRC/united-kingdom.osm.pbf" "$WORK/parking/near.tsv"
+
+step 10 $STEPS "Base map tiles (Planetiler, OpenMapTiles)" "15 to 20 minutes"
+echo "    Planetiler's own log follows, with its own progress and time left. Its few WAR lines about"
+echo "    boundaries it cannot close are neighbours' borders that run past the map's edge: expected."
 java -Xmx12g -jar "$SRC/planetiler.jar" --osm-path="$SRC/united-kingdom.osm.pbf" \
   --output="$WORK/omt.mbtiles" --download --download-dir="$SRC/sources" --tmpdir="$WORK/tmp" --force \
   --languages=en --exclude-layers=housenumber --maxzoom=14 --bounds=$BOUNDS
 
-step 10 $STEPS "Hiking tiles: paths, rights of way, routes, contours, car parks, peak scores" "2 to 3 minutes"
+step 11 $STEPS "Hiking tiles: paths, rights of way, routes, contours, car parks, peak scores" "2 to 3 minutes"
+echo "    Planetiler's own log follows; its \"data errors:\" list at the end is usually empty: expected."
 java -Xmx12g -cp "$SRC/planetiler.jar" pipeline/hiking/Hiking.java --osm-path="$SRC/united-kingdom.osm.pbf" \
-  --contours="$WORK/terrain/contours" --jut="$WORK/jut" --output="$WORK/hiking.mbtiles" --tmpdir="$WORK/tmp" --force \
+  --contours="$WORK/terrain/contours" --jut="$WORK/jut" --parking="$WORK/parking/near.tsv" --output="$WORK/hiking.mbtiles" --tmpdir="$WORK/tmp" --force \
   --maxzoom=14 --bounds=$BOUNDS
 
-step 11 $STEPS "Merge and cut tiles by region" "1 to 2 minutes"
+step 12 $STEPS "Merge and cut tiles by region" "1 to 2 minutes"
 $PY pipeline/tiles.py merge "$WORK/omt.mbtiles" "$WORK/hiking.mbtiles" "$WORK/merged.mbtiles"
 # The z0-7 overview the app ships, published beside the regions.
 $PY pipeline/tiles.py cut "$WORK/merged.mbtiles" "$WORK/regions.json" "$OUT" "$OUT/overview.mbtiles"
 
-step 12 $STEPS "Catalogue: sizes and checksums" "under a minute"
+step 13 $STEPS "Catalogue: sizes and checksums" "under a minute"
 $PY pipeline/catalog.py "$WORK/regions.json" "$OUT" "$VERSION"
 
 echo

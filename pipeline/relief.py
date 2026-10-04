@@ -51,6 +51,7 @@ import pyproj
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(__file__))
+from progress import left  # noqa: E402
 from tiles import create  # noqa: E402
 
 CELL = 20
@@ -324,6 +325,7 @@ def main():
     jobs = [(paths, x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
     outputs = {"shade": Output(shade_path, "shade", SHADE_TOP, bounds), "slope": Output(slope_path, "slope", SLOPE_TOP, bounds)}
     levels = {kind: {} for kind in outputs}
+    began = time.time()
     with Pool() as pool:
         for done, (x, y, kinds) in enumerate(pool.imap_unordered(pyramid, jobs), 1):
             for kind, (tiles, t) in kinds.items():
@@ -332,7 +334,8 @@ def main():
                 if t is not None:
                     levels[kind][(x, y)] = t
             print(f"\r    {done}/{len(jobs)} zoom {JOB} blocks, "
-                  + ", ".join(f"{k} {o.count} tiles {o.size / 1e6:.0f} MB" for k, o in outputs.items()), end="", flush=True)
+                  + ", ".join(f"{k} {o.count} tiles {o.size / 1e6:.0f} MB" for k, o in outputs.items())
+                  + f", {left(began, done, len(jobs))} ", end="", flush=True)
     print()
     # The zooms below the workers', from theirs.
     for kind, level in levels.items():

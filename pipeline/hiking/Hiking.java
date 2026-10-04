@@ -8,8 +8,13 @@ import com.onthegomap.planetiler.geo.GeometryException;
 import com.onthegomap.planetiler.reader.SourceFeature;
 import com.onthegomap.planetiler.reader.osm.OsmElement;
 import com.onthegomap.planetiler.reader.osm.OsmRelationInfo;
+import com.onthegomap.planetiler.reader.osm.OsmSourceFeature;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -41,15 +46,20 @@ import java.util.regex.Pattern;
  *                 at some times) or donation, where it is mapped; "access"
  *                 customers, for a shop's or a pub's; "kind" multi-storey,
  *                 underground, rooftop, street_side or layby, for any but a
- *                 car park on the ground; and its "name".
- *   jut           each named peak's score (pipeline/jut.py): how impressively
- *                 it rises above the paths and roads round it. A line from
- *                 its summit to its base, the place on a path or road it
- *                 rises most from, and a point at the base, each with the
- *                 "score" (whole metres). From zoom 10 for the highest
- *                 scores to 13 for the lowest, the highest first.
+ *                 car park on the ground; its "name"; and "path_m", the
+ *                 metres to the nearest path a walk would use, as
+ *                 pipeline/parking.py has it (to 10 m, at most 5000), for
+ *                 the app to leave out those in town.
+ *   jut           each named peak's scores (pipeline/jut.py): how impressively
+ *                 it rises above where someone can stand round it, "kind"
+ *                 path (a path or road), sea or lake. For each, a point at
+ *                 the summit with its "score" (whole metres) and "rank" (1,
+ *                 the highest within 5 km; 2, the highest in its county),
+ *                 from zoom 10, the highest ranks and scores first; and from
+ *                 zoom 12 a line from the summit to its base, the place it
+ *                 rises most from, and a point there, with only "kind".
  *
- *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --jut=<dir> --output=...
+ *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --jut=<dir> --parking=<tsv> --output=...
  */
 public class Hiking implements Profile {
 
@@ -67,14 +77,11 @@ public class Hiking implements Profile {
   static final Set<String> CLOSED = Set.of("private", "no", "residents", "staff", "employees", "permit", "delivery",
     "disabled", "emergency", "military", "agricultural", "forestry");
 
+  /** Each car park's metres to the nearest path a walk would use (pipeline/parking.py), by [key]. */
+  static Map<Long, Integer> PATH_M = Map.of();
+
   /** Garages and the like, each someone's own. */
   static final Set<String> GARAGES = Set.of("garage_boxes", "garages", "garage", "carports", "sheds");
-
-  /**
-   * The lowest peak scores shown from zoom 10, 11 and 12; the rest from 13. Of Great Britain's 19,000 (October
-   * 2026), half score under 30, and 550 over 300: Liathach, the Glen Coe and Kintail ridges, Tryfan, Great Gable.
-   */
-  static final long JUT_Z10 = 300, JUT_Z11 = 100, JUT_Z12 = 30;
 
   @Override
   public List<OsmRelationInfo> preprocessOsmRelation(OsmElement.Relation rel) {
@@ -99,13 +106,22 @@ public class Hiking implements Profile {
       return;
     }
     if ("jut".equals(sf.getSource())) {
-      long score = sf.getLong("score");
-      var feature = sf.isPoint() ? features.point("jut") : features.line("jut");
-      feature
-        .setAttr("score", score)
-        .setSortKey((int) -Math.min(score, 100_000))
-        .setMinZoom(score >= JUT_Z10 ? 10 : score >= JUT_Z11 ? 11 : score >= JUT_Z12 ? 12 : 13)
-        .setMinPixelSize(0);
+      String kind = sf.getString("kind");
+      if (sf.hasTag("score")) {
+        long score = sf.getLong("score");
+        long rank = sf.getLong("rank");
+        features.point("jut")
+          .setAttr("kind", kind)
+          .setAttr("score", score)
+          .setAttr("rank", rank > 0 ? rank : null)
+          .setSortKey((int) -(rank * 100_000 + Math.min(score, 99_999)))
+          .setMinZoom(10);
+      } else {
+        (sf.isPoint() ? features.point("jut") : features.line("jut"))
+          .setAttr("kind", kind)
+          .setMinZoom(12)
+          .setMinPixelSize(0);
+      }
       return;
     }
     if (sf.hasTag("amenity", "parking")) {
@@ -230,9 +246,30 @@ public class Hiking implements Profile {
       .setAttr("access", sf.hasTag("access", "customers") ? "customers" : null)
       .setAttr("kind", kind)
       .setAttr("name", sf.getString("name"))
+      .setAttr("path_m", PATH_M.get(key(sf)))
       // The biggest first: drawn under the smaller ones round it, not over them.
       .setSortKey(spaces == null ? 0 : -Math.min(spaces, 100_000))
       .setMinZoom(10);
+  }
+
+  /** An OpenStreetMap element's id and type in one number, as pathM() reads them from parking.py's "n123", "w456", "r789". */
+  static long key(SourceFeature sf) {
+    int type = 2;
+    if (sf instanceof OsmSourceFeature<?> osm) {
+      var element = osm.originalElement();
+      type = element instanceof OsmElement.Node ? 0 : element instanceof OsmElement.Way ? 1 : 2;
+    }
+    return sf.id() * 3 + type;
+  }
+
+  static Map<Long, Integer> pathM(Path tsv) throws IOException {
+    Map<Long, Integer> out = new HashMap<>();
+    for (String line : Files.readAllLines(tsv)) {
+      int tab = line.indexOf('\t');
+      int type = "nwr".indexOf(line.charAt(0));
+      out.put(Long.parseLong(line.substring(1, tab)) * 3 + type, Integer.parseInt(line.substring(tab + 1)));
+    }
+    return out;
   }
 
   static Integer count(String value) {
@@ -336,6 +373,7 @@ public class Hiking implements Profile {
     Arguments arguments = Arguments.fromArgsOrConfigFile(args);
     Path contours = arguments.file("contours", "contour shapefile directory", Path.of("contours"));
     Path jut = arguments.file("jut", "peak score shapefile directory (pipeline/jut.py)", Path.of("jut"));
+    PATH_M = pathM(arguments.file("parking", "car parks' metres to a walk's path (pipeline/parking.py)", Path.of("parking.tsv")));
     Planetiler.create(arguments)
       .setProfile(new Hiking())
       .addOsmSource("osm", arguments.inputFile("osm_path", "OSM input file", Path.of("input.osm.pbf")))

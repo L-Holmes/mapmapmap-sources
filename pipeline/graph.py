@@ -39,6 +39,9 @@ from array import array
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(__file__))
+from progress import left  # noqa: E402
+
 CLIMB = 8.0
 # The factor for each kind of way. None of these are below 1, which is what
 # makes straight-line distance a safe A* heuristic in the app.
@@ -396,7 +399,9 @@ def cut(npz_path, regions_path, out_dir):
     lines = shapely.linestrings(np.column_stack([lon[idx] / 1e7, lat[idx] / 1e7]), indices=np.repeat(np.arange(len(kept)), n_pts))
     tree = shapely.STRtree(lines)
     suffix = ".driving.graph" if speed else ".graph"
-    for region in json.load(open(regions_path)):
+    regions = json.load(open(regions_path))
+    began = time.time()
+    for i, region in enumerate(regions, 1):
         t = time.time()
         if region["parent"] is None:
             sel = kept
@@ -405,7 +410,8 @@ def cut(npz_path, regions_path, out_dir):
             sel = kept[np.sort(tree.query(area, predicate="intersects"))]
         path = os.path.join(out_dir, region["id"] + suffix)
         write_region(path, g, sel, degree, speed)
-        print(f"{region['id']}: {len(sel)} edges, {os.path.getsize(path) / 1e6:.1f} MB in {time.time() - t:.0f}s")
+        print(f"{region['id']}: {len(sel)} edges, {os.path.getsize(path) / 1e6:.1f} MB in {time.time() - t:.0f}s"
+              f"  ({i} of {len(regions)} regions, {left(began, i, len(regions))})", flush=True)
 
 
 def write_region(path, g, sel, degree, speed):

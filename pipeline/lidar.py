@@ -41,6 +41,9 @@ import numpy as np
 import pyproj
 import shapely
 import tifffile
+
+sys.path.insert(0, os.path.dirname(__file__))
+from progress import left  # noqa: E402
 from scipy.ndimage import uniform_filter
 from shapely.geometry import shape
 from shapely.ops import transform
@@ -82,12 +85,57 @@ def path_of(cache, e, n):
     return os.path.join(cache, f"{e // 1000:03d}_{n // 1000:04d}.npz")
 
 
+def get(w, s, ea, no):
+    """The LIDAR in a box (OSGB metres, west, south, east, north), metres, row 0 the north, NaN where it has none."""
+    url = (f"{WCS}?service=WCS&version=2.0.1&request=GetCoverage&coverageId={COVERAGE}&format=image/tiff"
+           f"&subset=E({w},{ea})&subset=N({s},{no})&SCALEFACTOR={FETCHED_SCALE}")
+    want = ((no - s) // FETCHED, (ea - w) // FETCHED)
+    with urllib.request.urlopen(url, timeout=300) as r:
+        got = tifffile.imread(io.BytesIO(r.read())).astype(np.float32)
+    if got.shape != want:
+        raise ValueError(f"shape {got.shape}, not {want}")
+    return got
+
+
+def refused(ex):
+    """Whether the service said no (500), as it does for what it holds nothing of."""
+    return getattr(ex, "code", None) == 500
+
+
+def quarters(w, s, ea, no, put):
+    """
+    A square the service refuses, asked for again a quarter at a time, each
+    that comes put where it goes; how many came, or None if the service
+    could not be reached (then the square is tried whole next time).
+    """
+    mw, mn = (w + ea) // 2, (s + no) // 2
+    came = 0
+    for box in ((w, s, mw, mn), (mw, s, ea, mn), (w, mn, mw, no), (mw, mn, ea, no)):
+        for attempt in range(3):
+            try:
+                put(*box, get(*box))
+                came += 1
+                break
+            except Exception as ex:  # noqa: BLE001 - refused, or a hiccup: try again, then leave it
+                if refused(ex):
+                    break
+                if attempt == 2:
+                    return None
+                time.sleep(5)
+    return came
+
+
 def fetch(cache, e, n, dem):
     """
     Fetches one square into the cache; True if it is there now. The service
     refuses (500) a square inside its extent that it holds nothing of,
     which is the open sea: where Terrain 50 [dem] has only sea, a refusal
-    is taken as that, and kept as an empty square, not tried again.
+    is taken as that, and kept as an empty square, not tried again. It
+    refuses some squares of land too, where it holds only part (near
+    Chester, 300000,380000, every time since October 2026): those are
+    asked for in quarters, and the quarters it refuses left to Terrain 50.
+    Once at least one quarter has come (so it is not the service being
+    down), the square is kept like that, not asked for again.
     """
     path = path_of(cache, e, n)
     if os.path.exists(path):
@@ -97,27 +145,29 @@ def fetch(cache, e, n, dem):
     heights = np.full((PIXELS, PIXELS), np.nan, np.float32)
     w, s, ea, no = max(e, EXTENT[0]), max(n, EXTENT[1]), min(e + SQUARE, EXTENT[2]), min(n + SQUARE, EXTENT[3])
     if w < ea and s < no:
-        url = (f"{WCS}?service=WCS&version=2.0.1&request=GetCoverage&coverageId={COVERAGE}&format=image/tiff"
-               f"&subset=E({w},{ea})&subset=N({s},{no})&SCALEFACTOR={FETCHED_SCALE}")
-        want = ((no - s) // FETCHED, (ea - w) // FETCHED)
+        def put(bw, bs, be, bn, got):
+            # The service's row 0 is the north.
+            top, col = (n + SQUARE - bn) // FETCHED, (bw - e) // FETCHED
+            heights[top:top + got.shape[0], col:col + got.shape[1]] = got
+
         for attempt in range(5):
             try:
-                with urllib.request.urlopen(url, timeout=300) as r:
-                    got = tifffile.imread(io.BytesIO(r.read())).astype(np.float32)
-                if got.shape != want:
-                    raise ValueError(f"shape {got.shape}, not {want}")
+                put(w, s, ea, no, get(w, s, ea, no))
                 break
             except Exception as ex:  # noqa: BLE001 - a network or server hiccup: try again, then leave it
-                if sea and getattr(ex, "code", None) == 500:
-                    got = np.full(want, np.nan, np.float32)
+                if sea and refused(ex):
                     break
                 if attempt == 4:
-                    print(f"\n    {e},{n}: {ex}; Terrain 50 there for now")
-                    return False
+                    came = quarters(w, s, ea, no, put) if refused(ex) else None
+                    if not came:
+                        print(f"\n    {e},{n}: this 10 km square did not come from the Environment Agency this time"
+                              f" (it said: {ex}); OS Terrain 50 stands in there, as it always has where there is no"
+                              " LIDAR, and the square is asked for again next time")
+                        return False
+                    print(f"\n    {e},{n}: the Environment Agency has LIDAR for {came} of this 10 km square's 4"
+                          " quarters; OS Terrain 50 stands in for the rest, as it always has where there is no LIDAR")
+                    break
                 time.sleep(5 * 2 ** attempt)
-        # The service's row 0 is the north.
-        top, left = (n + SQUARE - no) // FETCHED, (w - e) // FETCHED
-        heights[top:top + want[0], left:left + want[1]] = got
     bad = ~np.isfinite(heights) | (heights < -1000)
     # The grid's row 0 is the south.
     dm = np.where(bad, NODATA, np.round(np.where(bad, 0, heights) * 10)).astype(np.int16)[::-1]
@@ -138,8 +188,8 @@ def fetch_all(cache, wanted, dem):
         for f in as_completed([pool.submit(fetch, cache, e, n, dem) for e, n in todo]):
             done += 1
             failed += 0 if f.result() else 1
-            left = (time.time() - start) / done * (len(todo) - done)
-            print(f"\r    {done}/{len(todo)} fetched, {failed} failed, ~{left / 60:.0f} min left ", end="", flush=True)
+            print(f"\r    {done} of {len(todo)} squares, {left(start, done, len(todo))}"
+                  + (f"; {failed} left to OS Terrain 50 for now" if failed else "") + " ", end="", flush=True)
     if todo:
         print()
 
@@ -203,7 +253,7 @@ def build(dem_path, cache, out_path):
             weight = uniform_filter(inside.astype(np.float32), size=2 * BLEND + 1, mode="nearest")
             height = np.where(inside, weight * np.nan_to_num(found) + (1 - weight) * height, height)
         out[r0:r1] = np.clip(np.round(height[r0 - a0:r1 - a0] * 10), -32767, 32767).astype(np.int16)
-        print(f"\r    grid: {r1 * CELL // 1000} of {ROWS * CELL // 1000} km north", end="", flush=True)
+        print(f"\r    grid: {r1 * CELL // 1000} of {ROWS * CELL // 1000} km north, {left(start, r1, ROWS)} ", end="", flush=True)
     print()
     out.flush()
     del out

@@ -35,6 +35,9 @@ from multiprocessing import Pool
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(__file__))
+from progress import left  # noqa: E402
+
 OVERVIEW_MAX = 7
 MAX_ZOOM = 14
 BUFFER = 0.02
@@ -210,7 +213,9 @@ def cut(src_path, regions_path, out_dir, overview_path=None, kind="mbtiles"):
     if overview_path:
         n = copy_tiles(src_path, overview_path, low, {**base, "maxzoom": str(OVERVIEW_MAX), "name": "overview"})
         print(f"overview: {n} tiles, {os.path.getsize(overview_path) / 1e6:.1f} MB")
-    for region in json.load(open(regions_path)):
+    regions = json.load(open(regions_path))
+    began = time.time()
+    for i, region in enumerate(regions, 1):
         t = time.time()
         path = os.path.join(out_dir, f"{region['id']}.{kind}")
         area = shape(region["geometry"]).buffer(BUFFER)
@@ -232,7 +237,8 @@ def cut(src_path, regions_path, out_dir, overview_path=None, kind="mbtiles"):
             "center": f"{(lon0 + lon1) / 2:.4f},{(lat0 + lat1) / 2:.4f},10",
         }
         n = copy_tiles(src_path, path, keys, meta)
-        print(f"{region['id']}: {n} tiles, {os.path.getsize(path) / 1e6:.1f} MB in {time.time() - t:.0f}s")
+        print(f"{region['id']}: {n} tiles, {os.path.getsize(path) / 1e6:.1f} MB in {time.time() - t:.0f}s"
+              f"  ({i} of {len(regions)} regions, {left(began, i, len(regions))})", flush=True)
 
 
 def main():
