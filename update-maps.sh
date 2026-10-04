@@ -27,6 +27,163 @@ for arg in "$@"; do
     *) echo "Unknown option: $arg" >&2; exit 1 ;;
   esac
 done
+
+# Publishes data/out as a GitHub release, for the app to download from:
+# every release holds every region under the same names, and apps read the
+# newest (releases/latest/download/). It is made as a draft and published
+# once every file is up, so no app sees a catalogue whose files are still
+# uploading; a draft of it is an upload that stopped partway, carried on
+# from where it got to. The release before stays, so a download begun from
+# it can finish; older ones are deleted. GitHub's limit is 2 GiB a file.
+publish() {
+  OUT=data/out
+  KEEP=2
+  PARALLEL=4
+  VERSION=$(python3 -c "import json; print(json.load(open('$OUT/catalog.json'))['version'])")
+  TAG="maps-$VERSION"
+  LIMIT=$((2 * 1024 * 1024 * 1024))
+  # The regions, and the two files the app ships and refreshes from here: the
+  # region outlines and the low-zoom overview (which *.mbtiles includes).
+  FILES=("$OUT/catalog.json" "$OUT"/*.mbtiles "$OUT"/*.graph "$OUT/app-regions.json")
+  for f in "${FILES[@]}"; do
+    size=$(stat -c %s "$f")
+    if (( size >= LIMIT )); then
+      echo "error: $f is $size bytes, over GitHub's 2 GiB limit" >&2
+      exit 1
+    fi
+  done
+
+  # A draft of this release is an upload that stopped partway: carry on from
+  # where it got to. A published one is being replaced. IS_DRAFT is "true",
+  # "false", or empty for no such release. It is read off the list so that a
+  # dropped connection stops the run, rather than passing for "no release"
+  # and starting a second draft of it.
+  IS_DRAFT=$(gh release list --repo "$REPO" --json tagName,isDraft --jq ".[] | select(.tagName == \"$TAG\") | .isDraft")
+  UPLOADED=""
+  if [[ "$IS_DRAFT" == "true" ]]; then
+    echo "==> Resuming the unfinished upload of $TAG"
+    UPLOADED=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[] | select(.state == "uploaded") | "\(.name) \(.size)"')
+  elif [[ "$IS_DRAFT" == "false" ]]; then
+    echo "==> $TAG exists; replacing it"
+    gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
+  fi
+
+  echo "==> Release $TAG on $REPO: ${#FILES[@]} files, $(du -shc "${FILES[@]}" | tail -1 | cut -f1)"
+  if [[ "$IS_DRAFT" != "true" ]]; then
+    # Made as a draft and only published once every file is up, so no app
+    # ever sees a catalogue whose files are still uploading.
+    NOTES="Map data for Great Britain from OpenStreetMap, OS Terrain 50 and the Environment Agency's LIDAR; version $VERSION (the data's date, and the pipeline's revision).
+
+Each region is five files: \`<region>.mbtiles\` (vector map tiles), \`<region>.graph\` (the walking graph the app routes on), \`<region>.driving.graph\` (the driving graph), and \`<region>.shade.mbtiles\` and \`<region>.slope.mbtiles\` (raster tiles of hill shading, and of steep ground). \`catalog.json\` lists them with their sizes and SHA-256. \`overview.mbtiles\` and \`app-regions.json\` are what the app ships inside itself.
+
+© OpenStreetMap contributors, available under the Open Database Licence. Contains OS data © Crown copyright and database right. Contains Environment Agency LIDAR data © Environment Agency copyright and/or database right, under the Open Government Licence v3.0."
+    gh release create "$TAG" --repo "$REPO" --draft --title "Maps $VERSION" --notes "$NOTES"
+  fi
+
+  # What is left, with its size, to say how far along the upload is.
+  TODO=()
+  LEFT=0
+  for f in "${FILES[@]}"; do
+    size=$(stat -c %s "$f")
+    grep -qx "$(basename "$f") $size" <<<"$UPLOADED" && continue
+    TODO+=("$f")
+    LEFT=$((LEFT + size))
+  done
+  echo "    ${#TODO[@]} files to upload, $((LEFT / 1000000)) MB, $PARALLEL at a time"
+  # Several at once: GitHub gives one upload a fraction of what the line can
+  # do. The next starts as soon as any finishes. Over hours of uploading a
+  # connection is bound to drop now and then, so a file that fails is tried
+  # again, five tries in all; one that still fails stops the run (run it
+  # again to carry on from there). Stopping for any reason, Ctrl-C too, stops
+  # the uploads under way, rather than leaving them running behind the prompt.
+  DONE=0                 # bytes in the files finished
+  BEGAN=$SECONDS
+  SAID=$SECONDS          # when it last said how far along it is
+  LOGS=$(mktemp -d)      # what each file's latest try said
+  declare -A RUNNING=()  # upload's pid -> its file
+  trap 'for j in $(jobs -p); do kill $j $(pgrep -P $j) 2>/dev/null || true; done; rm -rf "$LOGS"' EXIT
+  trap 'echo; echo "==> Stopped. What is up so far stays up: run ./update-maps.sh again to carry on."; exit 130' INT TERM HUP
+  upload() {
+    local name try
+    name=$(basename "$1")
+    for try in 1 2 3 4 5; do
+      gh release upload "$TAG" "$1" --repo "$REPO" --clobber >"$LOGS/$name" 2>&1 && return 0
+      (( try < 5 )) || return 1
+      echo "    $name failed ($(tail -1 "$LOGS/$name")); trying again in $try min"
+      sleep $((try * 60))
+    done
+  }
+  # How far along it is: the files finished, and as far as each upload under
+  # way has read into its file.
+  progress() {
+    local sent=$DONE pid p fd pos took
+    for pid in "${!RUNNING[@]}"; do
+      for p in $(pgrep -P "$pid"); do
+        for fd in /proc/$p/fd/*; do
+          [[ "$(readlink "$fd" 2>/dev/null)" == "${RUNNING[$pid]}" ]] || continue
+          pos=$(awk '/^pos:/ {print $2}' "/proc/$p/fdinfo/${fd##*/}" 2>/dev/null || true)
+          sent=$((sent + ${pos:-0}))
+        done
+      done
+    done
+    took=$((SECONDS - BEGAN))
+    printf '%d of %d MB done, ' $((sent / 1000000)) $((LEFT / 1000000))
+    if (( sent > 0 && took > 0 )); then
+      printf '%d kB/s, about %d min left' $((sent / took / 1000)) $(( (LEFT - sent) * took / sent / 60 ))
+    else
+      printf 'measuring speed'
+    fi
+  }
+  # Waits for an upload to end, saying every minute meanwhile how it is
+  # going: the biggest file takes the best part of an hour.
+  finish_one() {
+    local pid f names
+    while :; do
+      for pid in "${!RUNNING[@]}"; do
+        kill -0 "$pid" 2>/dev/null && continue
+        f=${RUNNING[$pid]}
+        unset "RUNNING[$pid]"
+        if ! wait "$pid"; then
+          echo "error: $(basename "$f") would not upload (five tries, over ten minutes); the last said:" >&2
+          echo "       $(tail -1 "$LOGS/$(basename "$f")")" >&2
+          echo "       What is up so far stays up: run ./update-maps.sh again to carry on from here." >&2
+          exit 1
+        fi
+        DONE=$((DONE + $(stat -c %s "$f")))
+        return
+      done
+      sleep 5
+      if (( SECONDS - SAID >= 60 )); then
+        names=""
+        for pid in "${!RUNNING[@]}"; do names="${names:+$names, }$(basename "${RUNNING[$pid]}")"; done
+        echo "    ... $(progress); uploading $names"
+        SAID=$SECONDS
+      fi
+    done
+  }
+  for i in "${!TODO[@]}"; do
+    f=${TODO[$i]}
+    while (( ${#RUNNING[@]} >= PARALLEL )); do finish_one; done
+    printf '    [%d/%d] %s, %d MB  (%s)\n' $((i + 1)) ${#TODO[@]} "$(basename "$f")" \
+      $(( $(stat -c %s "$f") / 1000000 )) "$(progress)"
+    SAID=$SECONDS
+    upload "$f" &
+    RUNNING[$!]=$(realpath "$f")
+  done
+  while (( ${#RUNNING[@]} > 0 )); do finish_one; done
+  gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+
+  echo "==> Keeping the newest $KEEP releases"
+  gh release list --repo "$REPO" --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName' \
+    | tail -n +$((KEEP + 1)) \
+    | while read -r old; do
+        echo "    deleting $old"
+        gh release delete "$old" --repo "$REPO" --yes --cleanup-tag
+      done
+
+  echo "==> Published: https://github.com/$REPO/releases/latest/download/catalog.json"
+}
+
 lock
 
 command -v gh >/dev/null || { echo "error: needs the GitHub CLI (gh); see README.md" >&2; exit 1; }
@@ -38,7 +195,7 @@ BUILT=$(python3 -c "import json; print(json.load(open('data/out/catalog.json'))[
 DRAFT=$(gh release list --repo "$REPO" --json tagName,isDraft --jq '.[] | select(.isDraft) | .tagName' | head -1)
 if [[ -n "$DRAFT" && "$DRAFT" == "maps-$BUILT" ]]; then
   echo "==> An upload of $DRAFT stopped partway; finishing it"
-  pipeline/publish.sh
+  publish
   # That is this run's job done: apps have the maps now. Anything newer
   # waits for the next run, rather than hours more building on the back of it.
   echo
@@ -60,6 +217,6 @@ if [[ "$PUBLISHED" == "$WANT" && "$FORCE" -eq 0 ]]; then
 fi
 
 pipeline/build.sh --fresh
-pipeline/publish.sh
+publish
 echo
 echo "==> Maps updated in $(elapsed)"

@@ -35,8 +35,21 @@ import java.util.regex.Pattern;
  *                 (metres, a whole number, if it has one). OpenMapTiles'
  *                 mountain_peak keeps only a few per patch below zoom 12,
  *                 not the highest; the app labels these, the highest first.
+ *   parking       every car park the public may use, as a point, from zoom
+ *                 10: "spaces", its capacity, or for one without, worked
+ *                 out from its area ("est" 1); "fee" no, yes, times (paid
+ *                 at some times) or donation, where it is mapped; "access"
+ *                 customers, for a shop's or a pub's; "kind" multi-storey,
+ *                 underground, rooftop, street_side or layby, for any but a
+ *                 car park on the ground; and its "name".
+ *   jut           each named peak's score (pipeline/jut.py): how impressively
+ *                 it rises above the paths and roads round it. A line from
+ *                 its summit to its base, the place on a path or road it
+ *                 rises most from, and a point at the base, each with the
+ *                 "score" (whole metres). From zoom 10 for the highest
+ *                 scores to 13 for the lowest, the highest first.
  *
- *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --output=...
+ *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --jut=<dir> --output=...
  */
 public class Hiking implements Profile {
 
@@ -46,6 +59,22 @@ public class Hiking implements Profile {
 
   /** An OSM height: "978", "978.4", "978 m", or in feet, "3209 ft" or "3209'". */
   static final Pattern HEIGHT = Pattern.compile("\\s*(-?\\d+(?:\\.\\d+)?)\\s*(m|ft|feet|')?\\s*");
+
+  /** A count as mapped: "40", and the odd "~40", "c. 40", "40-ish" or "1000+". */
+  static final Pattern COUNT = Pattern.compile("\\s*(?:~|c\\.|ca\\.|approx\\.?)?\\s*(\\d+).*");
+
+  /** Car parks the public may not use: private, residents', staff's, by permit, the disabled's alone. */
+  static final Set<String> CLOSED = Set.of("private", "no", "residents", "staff", "employees", "permit", "delivery",
+    "disabled", "emergency", "military", "agricultural", "forestry");
+
+  /** Garages and the like, each someone's own. */
+  static final Set<String> GARAGES = Set.of("garage_boxes", "garages", "garage", "carports", "sheds");
+
+  /**
+   * The lowest peak scores shown from zoom 10, 11 and 12; the rest from 13. Of Great Britain's 19,000 (October
+   * 2026), half score under 30, and 550 over 300: Liathach, the Glen Coe and Kintail ridges, Tryfan, Great Gable.
+   */
+  static final long JUT_Z10 = 300, JUT_Z11 = 100, JUT_Z12 = 30;
 
   @Override
   public List<OsmRelationInfo> preprocessOsmRelation(OsmElement.Relation rel) {
@@ -67,6 +96,20 @@ public class Hiking implements Profile {
         .setMinZoom(idx ? 11 : 13)
         .setMinPixelSize(0)
         .setPixelTolerance(0.4);
+      return;
+    }
+    if ("jut".equals(sf.getSource())) {
+      long score = sf.getLong("score");
+      var feature = sf.isPoint() ? features.point("jut") : features.line("jut");
+      feature
+        .setAttr("score", score)
+        .setSortKey((int) -Math.min(score, 100_000))
+        .setMinZoom(score >= JUT_Z10 ? 10 : score >= JUT_Z11 ? 11 : score >= JUT_Z12 ? 12 : 13)
+        .setMinPixelSize(0);
+      return;
+    }
+    if (sf.hasTag("amenity", "parking")) {
+      parking(sf, features);
       return;
     }
     String name = sf.getString("name");
@@ -140,6 +183,85 @@ public class Hiking implements Profile {
     }
   }
 
+  /**
+   * A car park, as a point: on it, for one mapped as an area. Its spaces
+   * where they are mapped, which is one car park in ten; for most others,
+   * from its area, at the area a space takes in those that are (UK data,
+   * September 2026: the median of 20,000 car parks on the ground, 24 m², and
+   * within a factor of two of the count for 86% of them; 14 m² a space
+   * along a street; a multi-storey's 26 m² a floor, which, with its floors
+   * not mapped, comes to 6 m² of its footprint, and 12 m² underground).
+   */
+  static void parking(SourceFeature sf, FeatureCollector features) {
+    String kind = sf.getString("parking", "surface");
+    if (CLOSED.contains(sf.getString("access", "")) || GARAGES.contains(kind)
+      || !(sf.isPoint() || sf.canBePolygon() || sf.canBeLine())) {
+      return;
+    }
+    kind = switch (kind) {
+      case "multi-storey", "underground", "rooftop", "layby" -> kind;
+      case "street_side", "lane", "on_kerb", "half_on_kerb", "shoulder" -> "street_side";
+      default -> null;
+    };
+    Integer spaces = count(sf.getString("capacity"));
+    boolean estimated = false;
+    if (spaces == null && sf.canBePolygon()) {
+      Integer levels = count(sf.getString("parking:levels", sf.getString("building:levels")));
+      double perSpace = switch (kind == null ? "" : kind) {
+        case "street_side" -> 14;
+        case "multi-storey" -> levels != null && levels > 0 ? 26.0 / levels : 6;
+        case "underground" -> levels != null && levels > 0 ? 26.0 / levels : 12;
+        default -> 24;
+      };
+      try {
+        double area = sf.areaMeters();
+        if (area > 0) {
+          spaces = (int) Math.max(1, Math.round(area / perSpace));
+          estimated = true;
+        }
+      } catch (GeometryException e) {
+        // No area to go by.
+      }
+    }
+    features.pointOnSurface("parking")
+      .setAttr("spaces", spaces)
+      .setAttr("est", estimated ? 1 : null)
+      .setAttr("fee", fee(sf))
+      .setAttr("access", sf.hasTag("access", "customers") ? "customers" : null)
+      .setAttr("kind", kind)
+      .setAttr("name", sf.getString("name"))
+      // The biggest first: drawn under the smaller ones round it, not over them.
+      .setSortKey(spaces == null ? 0 : -Math.min(spaces, 100_000))
+      .setMinZoom(10);
+  }
+
+  static Integer count(String value) {
+    if (value == null) {
+      return null;
+    }
+    var m = COUNT.matcher(value);
+    if (!m.matches() || m.group(1).length() > 6) {
+      return null;
+    }
+    int n = Integer.parseInt(m.group(1));
+    return n > 0 ? n : null;
+  }
+
+  /** Whether a car park charges: no, yes, times (some hours, as "Mo-Sa 08:00-18:00"), donation; null if not mapped. */
+  static String fee(SourceFeature sf) {
+    String fee = sf.getString("fee");
+    if (fee == null) {
+      return sf.hasTag("charge") ? "yes" : null;
+    }
+    fee = fee.trim().toLowerCase();
+    return switch (fee) {
+      case "no", "free", "none" -> "no";
+      case "yes", "paid", "pay", "pay_and_display", "pay_and_display;pay_on_exit", "pay_on_exit", "ticket" -> "yes";
+      case "donation", "donations" -> "donation";
+      default -> fee.matches(".*\\d\\d:\\d\\d.*") ? "times" : null;
+    };
+  }
+
   static Integer metres(String ele) {
     if (ele == null) {
       return null;
@@ -192,7 +314,7 @@ public class Hiking implements Profile {
   @Override
   public List<VectorTile.Feature> postProcessLayerFeatures(String layer, int zoom, List<VectorTile.Feature> items)
     throws GeometryException {
-    if (layer.equals("feature") || layer.equals("peak")) {
+    if (layer.equals("feature") || layer.equals("peak") || layer.equals("parking") || layer.equals("jut")) {
       return items;
     }
     // Join the pieces of each line that share their attributes, so dashes
@@ -213,10 +335,12 @@ public class Hiking implements Profile {
   public static void main(String[] args) throws Exception {
     Arguments arguments = Arguments.fromArgsOrConfigFile(args);
     Path contours = arguments.file("contours", "contour shapefile directory", Path.of("contours"));
+    Path jut = arguments.file("jut", "peak score shapefile directory (pipeline/jut.py)", Path.of("jut"));
     Planetiler.create(arguments)
       .setProfile(new Hiking())
       .addOsmSource("osm", arguments.inputFile("osm_path", "OSM input file", Path.of("input.osm.pbf")))
       .addShapefileGlobSource("EPSG:4326", "contours", contours, "*.shp", null)
+      .addShapefileGlobSource("EPSG:4326", "jut", jut, "*.shp", null)
       .overwriteOutput(arguments.file("output", "output file", Path.of("hiking.mbtiles")))
       .run();
   }

@@ -7,7 +7,7 @@
 #   pipeline/build.sh --fresh    first fetch Geofabrik's newest, if newer
 #   pipeline/build.sh --download-only   fetch the data, build nothing
 #
-# Needs Java 21+, uv, ~40 GB of disk and ~24 GB of RAM. Takes about an hour;
+# Needs Java 21+, uv, ~40 GB of disk and ~24 GB of RAM. Takes about two hours;
 # each step says roughly how long it usually takes. Everything lands under
 # data/ (gitignored): data/src downloads, data/work intermediate files,
 # data/out what gets published.
@@ -31,7 +31,7 @@ lock
 SRC=data/src WORK=data/work OUT=data/out
 PY=data/.venv/bin/python
 mkdir -p "$SRC" "$WORK" "$OUT"
-STEPS=11
+STEPS=12
 
 # --- Tools ---------------------------------------------------------------------
 
@@ -119,37 +119,42 @@ fi
 # out into the Atlantic, which would be a lot of empty sea tiles.
 BOUNDS=-8.8,49.8,2.0,61.0
 
-step 5 $STEPS "Base map tiles (Planetiler, OpenMapTiles)" "15 to 20 minutes"
-java -Xmx12g -jar "$SRC/planetiler.jar" --osm-path="$SRC/united-kingdom.osm.pbf" \
-  --output="$WORK/omt.mbtiles" --download --download-dir="$SRC/sources" --tmpdir="$WORK/tmp" --force \
-  --languages=en --exclude-layers=housenumber --maxzoom=14 --bounds=$BOUNDS
-
-step 6 $STEPS "Hiking tiles: paths, rights of way, routes, contours" "2 to 3 minutes"
-java -Xmx12g -cp "$SRC/planetiler.jar" pipeline/hiking/Hiking.java --osm-path="$SRC/united-kingdom.osm.pbf" \
-  --contours="$WORK/terrain/contours" --output="$WORK/hiking.mbtiles" --tmpdir="$WORK/tmp" --force \
-  --maxzoom=14 --bounds=$BOUNDS
-
-step 7 $STEPS "Merge and cut tiles by region" "1 to 2 minutes"
-$PY pipeline/tiles.py merge "$WORK/omt.mbtiles" "$WORK/hiking.mbtiles" "$WORK/merged.mbtiles"
-# The z0-7 overview the app ships, published beside the regions.
-$PY pipeline/tiles.py cut "$WORK/merged.mbtiles" "$WORK/regions.json" "$OUT" "$OUT/overview.mbtiles"
-
-step 8 $STEPS "Relief: hill shading and steep ground" "20 minutes; half an hour more the first time, fetching England's LIDAR (6 GB)"
+# The relief and the graphs come before the tiles: the peak scores, which
+# go in the tiles, are worked out from the relief's heights and the graphs' ways.
+step 5 $STEPS "Relief: hill shading and steep ground" "20 minutes; half an hour more the first time, fetching England's LIDAR (6 GB)"
 # 20 m heights: the Environment Agency's LIDAR in England, Terrain 50 elsewhere.
 $PY -u pipeline/lidar.py "$WORK/regions.json" "$WORK/terrain/dem.npy" "$SRC/lidar" "$WORK/terrain/heights.npy"
 $PY -u pipeline/relief.py "$WORK/terrain/heights.npy" "$WORK/shade.mbtiles" "$WORK/slope.mbtiles" "$BOUNDS"
 $PY pipeline/tiles.py cut-as shade.mbtiles "$WORK/shade.mbtiles" "$WORK/regions.json" "$OUT"
 $PY pipeline/tiles.py cut-as slope.mbtiles "$WORK/slope.mbtiles" "$WORK/regions.json" "$OUT"
 
-step 9 $STEPS "Walking graph" "about 20 minutes"
+step 6 $STEPS "Walking graph" "about 20 minutes"
 $PY -u pipeline/graph.py build "$SRC/united-kingdom.osm.pbf" "$WORK/terrain/dem.npy" "$WORK/graph.npz"
 $PY -u pipeline/graph.py cut "$WORK/graph.npz" "$WORK/regions.json" "$OUT"
 
-step 10 $STEPS "Driving graph" "about 15 minutes"
+step 7 $STEPS "Driving graph" "about 15 minutes"
 $PY -u pipeline/graph.py build-driving "$SRC/united-kingdom.osm.pbf" "$WORK/terrain/dem.npy" "$WORK/driving.npz"
 $PY -u pipeline/graph.py cut "$WORK/driving.npz" "$WORK/regions.json" "$OUT"
 
-step 11 $STEPS "Catalogue: sizes and checksums" "under a minute"
+step 8 $STEPS "Peak scores: how each peak rises above the paths and roads round it" "about 15 minutes"
+$PY -u pipeline/jut.py "$SRC/united-kingdom.osm.pbf" "$WORK/terrain/heights.npy" "$WORK/graph.npz" "$WORK/driving.npz" "$WORK/jut"
+
+step 9 $STEPS "Base map tiles (Planetiler, OpenMapTiles)" "15 to 20 minutes"
+java -Xmx12g -jar "$SRC/planetiler.jar" --osm-path="$SRC/united-kingdom.osm.pbf" \
+  --output="$WORK/omt.mbtiles" --download --download-dir="$SRC/sources" --tmpdir="$WORK/tmp" --force \
+  --languages=en --exclude-layers=housenumber --maxzoom=14 --bounds=$BOUNDS
+
+step 10 $STEPS "Hiking tiles: paths, rights of way, routes, contours, car parks, peak scores" "2 to 3 minutes"
+java -Xmx12g -cp "$SRC/planetiler.jar" pipeline/hiking/Hiking.java --osm-path="$SRC/united-kingdom.osm.pbf" \
+  --contours="$WORK/terrain/contours" --jut="$WORK/jut" --output="$WORK/hiking.mbtiles" --tmpdir="$WORK/tmp" --force \
+  --maxzoom=14 --bounds=$BOUNDS
+
+step 11 $STEPS "Merge and cut tiles by region" "1 to 2 minutes"
+$PY pipeline/tiles.py merge "$WORK/omt.mbtiles" "$WORK/hiking.mbtiles" "$WORK/merged.mbtiles"
+# The z0-7 overview the app ships, published beside the regions.
+$PY pipeline/tiles.py cut "$WORK/merged.mbtiles" "$WORK/regions.json" "$OUT" "$OUT/overview.mbtiles"
+
+step 12 $STEPS "Catalogue: sizes and checksums" "under a minute"
 $PY pipeline/catalog.py "$WORK/regions.json" "$OUT" "$VERSION"
 
 echo

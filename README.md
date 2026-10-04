@@ -14,7 +14,7 @@ https://github.com/L-Holmes/mapmapmap-sources/releases/latest/download/catalog.j
 | File | What it is |
 | --- | --- |
 | `catalog.json` | Every region's files, with sizes and SHA-256, the version (the data's date and the pipeline's revision), and the format |
-| `<region>.mbtiles` | Vector map tiles, zooms 8 to 14: roads, paths, public rights of way, waymarked routes, 10 m contours, land and water, and named waterfalls and valleys (for the app to name walks by) |
+| `<region>.mbtiles` | Vector map tiles, zooms 8 to 14: roads, paths, public rights of way, waymarked routes, 10 m contours, land and water, car parks with their spaces and fees, each named peak's score and the place it is seen best from, and named waterfalls and valleys (for the app to name walks by) |
 | `<region>.graph` | The walking graph the app plans routes on |
 | `<region>.driving.graph` | The driving graph the app plans car routes on |
 | `<region>.shade.mbtiles`, `<region>.slope.mbtiles` | The hiking map's relief, raster tiles: hill shading (zooms 8 to 12), and steep ground in bands from 25° (zooms 8 to 14); from the Environment Agency's LIDAR in England, OS Terrain 50 elsewhere |
@@ -62,10 +62,8 @@ run also fetches the Environment Agency's LIDAR for England (about half an
 hour; kept in `data/src/lidar`, so later runs fetch only squares that
 failed). The relief's 20 m height grid and what is worked out from it take
 about 10 GB of `data/work`.
-`pipeline/build.sh` and `pipeline/publish.sh` are its two halves, to run
-separately if wanted (`pipeline/build.sh --download-only` just fetches the
-data). `pipeline/serve.sh` serves `data/out` to a
-USB-attached phone, to try a build before publishing it.
+`pipeline/serve.sh` serves `data/out` to a USB-attached phone, to try a
+build before publishing it.
 
 ### How a release is published
 
@@ -117,14 +115,54 @@ countries, and England's 47 counties.
 | `pipeline/terrain.py` | OS Terrain 50 as one 1.4 GB height grid (`dem.npy`), and 10 m contours, traced with contourpy and written as shapefiles in WGS84. |
 | `pipeline/lidar.py` | A 20 m height grid for the relief (`heights.npy`): the Environment Agency's LIDAR Composite DTM in England, fetched from its WCS at 10 m in 10 km squares (cached in `data/src/lidar`), OS Terrain 50 elsewhere, blended where they meet. |
 | `pipeline/relief.py` | The relief's raster tiles from it: hill shading (`shade.mbtiles`, zooms 8 to 12) and steep ground in bands from 25° (`slope.mbtiles`, zooms 8 to 14; the zooms below keep the steepest pixel, so it shows zoomed out). |
+| `pipeline/jut.py` | Each named peak's score, how impressively it rises above the paths and roads round it, and the place on one it rises most from (see below), for the hiking tiles' `jut` layer. |
 | Planetiler, OpenMapTiles profile | The base map: land, water, roads, places, peaks, to z14. |
-| `pipeline/hiking/Hiking.java` | A Planetiler profile of our own for what OpenMapTiles leaves out: every path with its UK right of way (`row`), SAC difficulty, faint or private access; waymarked routes from route relations; the contours. |
+| `pipeline/hiking/Hiking.java` | A Planetiler profile of our own for what OpenMapTiles leaves out: every path with its UK right of way (`row`), SAC difficulty, faint or private access; waymarked routes from route relations; the contours; every named peak; and every car park the public may use, from zoom 10, with its spaces (mapped, or worked out from its area: see below), fee, and whether it is for customers only; and the peak scores `jut.py` works out. |
 | `pipeline/tiles.py merge` | Both tile sets in one file. A vector tile's layers are a repeated protobuf field, so two tiles' bytes, concatenated, are one tile with both sets of layers. |
 | `pipeline/tiles.py cut` | Each region's tiles, z8 and up, within ~2 km of its outline, and the z0-7 overview the app ships (`overview.mbtiles`, 1.5 MB). Tiles are deduplicated: the sea is stored once. |
 | `pipeline/graph.py build` | The walking graph for all of Great Britain: walkable ways split at junctions, each edge costed both ways. |
 | `pipeline/graph.py build-driving` | The driving graph for all of Great Britain: roads cars may use, and car ferries, costed by speed each way. |
 | `pipeline/graph.py cut` | Each region's graph, in the app's binary format (documented in the app's `routing/Graph.kt`). Networks of under 50 edges, mapped without joining anything, are dropped: snapping to one would strand a route. |
 | `pipeline/catalog.py` | `catalog.json`: each region's files, sizes and SHA-256, and the version (the OSM data's date and the pipeline's revision). |
+
+### Car parks
+
+The `parking` layer is every `amenity=parking` but those closed to the
+public (`access` private, residents, staff, permit, disabled and the like)
+and garages, a point each, from zoom 10. OpenStreetMap gives `capacity`
+for one car park in ten (UK, September 2026) and `fee` for one in five.
+A car park mapped as an area with no capacity has its spaces worked out
+from its area, at what a space takes in those that do have one: 24 m² on
+the ground (the median of 20,000; within a factor of two of the count for
+86% of them), 14 m² along a street, 26 m² a floor in a multi-storey or
+underground one whose floors are mapped, and otherwise 6 m² of a
+multi-storey's footprint, 12 m² of an underground one's. Those carry
+`est` 1, and the app says "About". The layer adds about 5% to the tiles
+(Great Britain's hiking tiles 478 MB to 503 MB; Lancashire 47.0 MB to
+47.7 MB).
+
+### Peak scores
+
+How impressively each named peak rises above the paths and roads round
+it, and where from, which the app can draw as a dotted line from the
+summit to that place with the score by it. It starts from Kai Xu's
+[jut](https://peakjut.com/about): how impressively a summit P rises
+above a point Q is h·sin θ, h its height above Q's horizon and θ the
+angle Q looks up at it, at the Q that makes it most. Adjusted:
+
+- Q must be on a path or a road (any way in the walking or driving
+  graph, ferries aside), looked for within 10 km.
+- The steepness that counts is the climb's shape, not only its straight
+  line: the distance each third of the height takes, the lowest third
+  counted three times and the middle twice, as an angle. So ground rising
+  straight from the path counts for more than a level stretch before the
+  climb.
+- Steepness counts for more: score = jut × (1 + 1.1 / (1 + e^(-0.45
+  (steepness - 30°)))), ×1 on gentle ground, ×1.55 at 30°, to ×2.1.
+
+P is the summit (the highest 20 m cell within 40 m of the peak as
+mapped), on the relief's 20 m heights. `data/work/jut/jut.tsv` lists
+every peak's score with what went into it.
 
 ### The walking graph
 
