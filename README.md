@@ -161,11 +161,13 @@ above a point Q is h·sin θ, h its height above Q's horizon and θ the
 angle Q looks up at it, at the Q that makes it most. Adjusted:
 
 - Q must be somewhere a person is, looked for within 10 km. There are
-  three scores, by where: a path or road (any way in the walking or
-  driving graph, ferries aside); the sea's edge, at sea level (the
-  coastline's sea, so sea lochs count); and a lake's edge, at its
-  water's height (lakes, ponds and reservoirs of a hectare or more; not
-  rivers or canals).
+  scores by where: a path or road (any way in the walking or driving
+  graph, ferries aside); the sea's edge, at sea level (the coastline's
+  sea, so sea lochs count); and a lake's edge, at its water's height
+  (lakes, ponds and reservoirs; not rivers or canals), three times over:
+  counting any lake of a hectare or more (`lake`), only those of 10 ha
+  or more (`lake10`), and only those of 50 ha or more, lakes like
+  Buttermere (`lake50`). The app's settings choose which lakes count.
 - The steepness that counts is the climb's shape, not only its straight
   line: the distance each third of the height takes, the lowest third
   counted three times and the middle twice, as an angle. So ground rising
@@ -178,8 +180,12 @@ P is the summit (the highest 20 m cell within 40 m of the peak as
 mapped), on the relief's 20 m heights. Each score is ranked too: the
 highest within 5 km, and the highest in its county (England's counties
 as the regions have them; Scotland's council areas and Wales's principal
-areas), which the app draws bigger. `data/work/jut/jut.tsv` lists every
-score with what went into it. All three add about 2.4% to the tiles.
+areas) when nothing within 15 km, over the border either, is higher,
+which the app draws bigger, and those within a tenth of the
+highest within 5 km, a little bigger. The scores are in the tiles from
+zoom 8, each with its peak's name, height, county and country, which is
+what the app's list of them reads. `data/work/jut/jut.tsv` lists every
+score with what went into it.
 
 ### The walking graph
 

@@ -2,8 +2,11 @@
 """
 Each named peak's scores, how impressively it rises above where someone
 can stand round it, and the place it does so most from: its base, the
-best place to see it from. Three, by where that is: a path or a road
-("path"), the sea ("sea"), or a lake ("lake").
+best place to see it from. By where that is: a path or a road ("path"),
+the sea ("sea"), or a lake, three ways, by the least size of lake counted
+(see LAKE_HA): any of a hectare or more, as big as a tarn ("lake"), of
+10 ha or more ("lake10"), or of 50 ha or more, lakes like Buttermere
+("lake50").
 
     jut.py <osm.pbf> <sea polygons .zip> <regions.json> <heights.npy> <graph.npz> <driving.npz> <out dir>
 
@@ -18,11 +21,11 @@ adjusted ("ajut"):
     gully no one goes to: for "path", any way in the walking or the
     driving graph (pipeline/graph.py), ferries aside; for "sea", the
     sea's edge, as OpenStreetMap's coastline has it (sea lochs and
-    estuaries are sea), at sea level; for "lake", a lake's edge, at its
-    water's height: OpenStreetMap's lakes, ponds and reservoirs of a
-    hectare or more, not rivers, canals or the like. (Further out on the
-    water is never better: the edge on the way in is nearer, as high,
-    and has no flat start.)
+    estuaries are sea), at sea level; for "lake" and the bigger lakes', a
+    lake's edge, at its water's height: OpenStreetMap's lakes, ponds and
+    reservoirs of that size or more, not rivers, canals or the like.
+    (Further out on the water is never better: the edge on the way in is
+    nearer, as high, and has no flat start.)
   - The steepness that counts is the climb's, not just the straight
     line's: how far it goes for each third of its height (from where the
     ground first reaches it to where it first reaches the next), the
@@ -47,19 +50,31 @@ the middle of each cell. The score, like jut, is in metres: a cliff of
 Each kind of score is ranked too: 1 for a peak whose score is the
 highest within 5 km, 2 for the highest in its county (England's counties
 as regions.json has them; Scotland's council areas and Wales's principal
-areas, from OpenStreetMap), else 0.
+areas, from OpenStreetMap) when no peak within 15 km of it, in any
+county, is higher either, else 0. Borders run over ranges (the
+Cairngorms are in three counties, Snowdonia two): a county's highest
+alone would star a peak each side, the lower beside higher ones over the
+border. So a county whose highest is outdone near it has no star. One
+ranked 0 is "close" when it is within a tenth of the highest within
+5 km.
 
 Writes, in <out dir>:
 
     ways.npy     every 20 m cell a path or road crosses, 1 (uint8, laid
                  out as heights.npy); made again when a graph is newer
-    water.npy    every 20 m cell of sea, 1, and of lake, 2; made again when
-                 the OpenStreetMap data or the sea's polygons are newer
+    water-sizes.npy  every 20 m cell of sea, 1, and of lake, 2, 3 or 4 by
+                 its size (LAKE_HA's, smallest first); made again when the
+                 OpenStreetMap data or the sea's polygons are newer
     counties.json  Scotland's and Wales's, from OpenStreetMap, made with it
     summits.shp  each peak's scores, a point at its summit for each kind it
-                 has one of: "kind", "score" (whole metres) and "rank"
+                 has one of: "kind", "score" (whole metres), "rank" and
+                 "close" (1 or 0); and, for the app's list of them, the
+                 peak's "name", "ele" (metres: as mapped, or else its
+                 summit's height here), "county" and "country" (England,
+                 Scotland or Wales; both blank outside every county)
     lines.shp    a line from the summit to the base for each, with "kind"
-    bases.shp    each base, a point, with "kind"
+                 and "peak_score", the summit's score
+    bases.shp    each base, a point, with "kind" and "peak_score"
     jut.tsv      every score, with what went into it
 
 Peaks are OpenStreetMap's named natural=peak, hill and volcano, as the
@@ -71,6 +86,7 @@ would round to 0.
 import csv
 import json
 import os
+import re
 import sys
 import time
 from multiprocessing import Pool
@@ -92,12 +108,18 @@ THIRDS = np.array([3.0, 2.0, 1.0])  # how much the lower, middle and upper third
 LIFT, MIDDLE, RATE = 1.1, 30.0, 0.45
 BATCH = 256
 FERRY = 16  # graph.py's ROAD.index("ferry")
-KINDS = ("path", "sea", "lake")
-SEA, LAKE = 1, 2  # in water.npy
-LAKE_M2 = 10_000
+# Lakes, by the least area counted, hectares: any as big as a tarn; big tarns and small lakes; lakes like
+# Buttermere and up.
+LAKE_HA = {"lake": 1, "lake10": 10, "lake50": 50}
+KINDS = ("path", "sea", *LAKE_HA)
+SEA, LAKE = 1, 2  # in water-sizes.npy, a lake LAKE + the index of the biggest of LAKE_HA it is as big as
 # OpenStreetMap's water=* for a lake, a pond or a reservoir; none at all, mostly those too.
 LAKES = {None, "lake", "pond", "reservoir", "lagoon", "oxbow", "mere", "fishpond", "lake;pond", "dew_pond"}
 NEAR = 5_000  # a peak with the highest score within this is ranked 1
+CLOSE = 0.9  # and one with this much of that score or more is "close"
+AREA = 15_000  # the highest in its county is ranked 2 when none within this, in any county, is higher
+# An OpenStreetMap height: "978", "978.4", "978 m", or in feet, "3209 ft" or "3209'" (Hiking.java's HEIGHT).
+HEIGHT = re.compile(r"\s*(-?\d+(?:\.\d+)?)\s*(m|ft|feet|')?\s*")
 GB = (-8.8, 49.8, 2.0, 61.0)  # west, south, east, north: where the sea's polygons are read
 
 
@@ -203,7 +225,8 @@ def bases(peak):
     kinds it has one of. Paths and roads: every cell one crosses, at the
     ground's height. The sea and lakes: the cells at their edge, the sea's
     at sea level and a lake's at its water's (the lowest of its cells round
-    each, as the edge's own are partly shore).
+    each, as the edge's own are partly shore); for each size of lake, the
+    lakes that size or bigger.
     """
     from scipy.ndimage import binary_erosion, minimum_filter
     e, n = peak
@@ -222,8 +245,8 @@ def bases(peak):
     if len(rr):
         found["path"] = search(z, r0, c0, rr, cc, z[rr, cc].astype(np.float64), e, n, zp)
     water = np.asarray(WATER[r0:r1, c0:c1])
-    for kind, value in (("sea", SEA), ("lake", LAKE)):
-        mask = water == value
+    masks = [("sea", water == SEA)] + [(kind, water >= LAKE + i) for i, kind in enumerate(LAKE_HA)]
+    for kind, mask in masks:
         if not mask.any():
             continue
         # Past the window's edge counts as more of it, not as its edge.
@@ -242,37 +265,54 @@ def bases(peak):
 def ranks(where, scores, county):
     """
     Each score's rank: 2 for the highest in its county (county[i], -1 for
-    none), 1 for the highest within NEAR of it, else 0; where a tie, the
-    first. where: the peaks' OSGB eastings and northings.
+    none) when none within AREA of it, in any county, is higher; 1 for the
+    highest within NEAR of it; else 0. Where a tie, the first. And whether
+    each ranked 0 is close: CLOSE of the highest within NEAR of it or more.
+    where: the peaks' OSGB eastings and northings.
     """
     from scipy.spatial import cKDTree
+    tree = cKDTree(where)
+
+    def highest(i, near):
+        return all(scores[i] > scores[j] or (scores[i] == scores[j] and i < j) for j in near if j != i)
+
     rank = np.zeros(len(scores), dtype=np.int64)
-    for i, near in enumerate(cKDTree(where).query_ball_point(where, NEAR)):
-        if all(scores[i] > scores[j] or (scores[i] == scores[j] and i < j) for j in near if j != i):
+    close = np.zeros(len(scores), dtype=bool)
+    for i, near in enumerate(tree.query_ball_point(where, NEAR)):
+        if highest(i, near):
             rank[i] = 1
+        else:
+            close[i] = scores[i] >= CLOSE * max(scores[j] for j in near)
     for c in np.unique(county[county >= 0]):
         within = np.flatnonzero(county == c)
-        rank[within[np.argmax(scores[within])]] = 2
-    return rank
+        best = within[np.argmax(scores[within])]
+        if highest(best, tree.query_ball_point(where[best], AREA)):
+            rank[best] = 2
+    return rank, close & (rank == 0)
 
 
 def counties_of(lon, lat, regions_path, counties_path):
-    """Which county each point is in, an index into the names returned, -1 for none; and the names."""
+    """
+    Which county each point is in, an index into the names returned, -1 for
+    none; and the names, and each one's country.
+    """
     import shapely
     from shapely.geometry import shape
-    names, geoms = [], []
+    names, countries, geoms = [], [], []
     for region in json.load(open(regions_path)):
         if region["parent"] == "england":
             names.append(region["name"])
+            countries.append("England")
             geoms.append(shape(region["geometry"]))
     for area in json.load(open(counties_path)):
         names.append(area["name"])
+        countries.append(area["country"])
         geoms.append(shapely.from_wkb(bytes.fromhex(area["wkb"])))
     within, which = shapely.STRtree(geoms).query(shapely.points(lon, lat), predicate="within")
     county = np.full(len(lon), -1)
     # The first where two overlap.
     county[within[::-1]] = which[::-1]
-    return county, names
+    return county, names, countries
 
 
 # --- Inputs and outputs ----------------------------------------------------------
@@ -314,9 +354,10 @@ def rasterize(graphs, out_path):
 
 def areas(pbf):
     """
-    From OpenStreetMap, in one read: its lakes of LAKE_M2 or more, as OSGB
-    polygons; and Scotland's council areas and Wales's principal areas
-    (admin_level 6, GSS codes S12 and W06), as {"name", "wkb"} in WGS84.
+    From OpenStreetMap, in one read: its lakes as big as the least of
+    LAKE_HA or bigger, as OSGB polygons; and Scotland's council areas and
+    Wales's principal areas (admin_level 6, GSS codes S12 and W06), as
+    {"name", "country", "wkb"} in WGS84.
     """
     import osmium
     import shapely
@@ -339,13 +380,14 @@ def areas(pbf):
         except Exception:  # noqa: BLE001 - a multipolygon too broken to make
             continue
         if tags.get("boundary") == "administrative":
-            if (tags.get("ref:gss") or "")[:3] in ("S12", "W06") and tags.get("name"):
-                counties.append({"name": tags["name"], "wkb": shapely.to_wkb(geom, hex=True)})
+            country = {"S12": "Scotland", "W06": "Wales"}.get((tags.get("ref:gss") or "")[:3])
+            if country and tags.get("name"):
+                counties.append({"name": tags["name"], "country": country, "wkb": shapely.to_wkb(geom, hex=True)})
             continue
         if tags.get("water") not in LAKES or tags.get("waterway") or tags.get("tidal") == "yes":
             continue
         lake = transform(to_osgb, geom)
-        if lake.area >= LAKE_M2:
+        if lake.area >= min(LAKE_HA.values()) * 10_000:
             lakes.append(lake)
     return lakes, counties
 
@@ -359,7 +401,11 @@ def rings(polygons):
 
 
 def water_grid(sea_zip, lakes, out_path):
-    """The sea, 1, and the lakes, 2, in a grid like heights.npy, by drawing each polygon's cells."""
+    """
+    The sea, 1, and the lakes, LAKE and up by size, in a grid like
+    heights.npy, by drawing each polygon's cells: the lakes smallest first,
+    so that where two overlap, the bigger's cells are the bigger's.
+    """
     from PIL import Image, ImageDraw
     import shapely
     t = time.time()
@@ -387,10 +433,13 @@ def water_grid(sea_zip, lakes, out_path):
             draw.polygon(list(map(tuple, ring)), fill=SEA)
         for ring in holes:
             draw.polygon(list(map(tuple, ring)), fill=0)
-    for outer, holes in rings(np.array(lakes, dtype=object)):
-        draw.polygon(list(map(tuple, outer)), fill=LAKE)
-        for ring in holes:
-            draw.polygon(list(map(tuple, ring)), fill=0)
+    least = np.array(list(LAKE_HA.values())) * 10_000
+    for lake in sorted(lakes, key=lambda lake: lake.area):
+        size = LAKE + int(np.searchsorted(least, lake.area, side="right")) - 1
+        for outer, holes in rings(lake):
+            draw.polygon(list(map(tuple, outer)), fill=size)
+            for ring in holes:
+                draw.polygon(list(map(tuple, ring)), fill=0)
     grid = np.lib.format.open_memmap(out_path + ".part", mode="w+", dtype=np.uint8, shape=(ROWS, COLS))
     band = 5000
     for r in range(0, ROWS, band):
@@ -412,8 +461,16 @@ def water_and_counties(pbf, sea_zip, water_path, counties_path):
     os.replace(counties_path + ".part", counties_path)
 
 
+def metres(ele):
+    """An OpenStreetMap height, in whole metres, or None: as Hiking.java's metres() reads it."""
+    m = HEIGHT.fullmatch(ele or "")
+    if not m:
+        return None
+    return round(float(m.group(1)) * (0.3048 if m.group(2) not in (None, "m") else 1))
+
+
 def peaks(pbf):
-    """OpenStreetMap's named peaks, hills and volcanoes: (id, lon, lat, name)."""
+    """OpenStreetMap's named peaks, hills and volcanoes: (id, lon, lat, name, height as mapped or None)."""
     import osmium
     found = []
     fp = osmium.FileProcessor(pbf, osmium.osm.NODE).with_filter(
@@ -421,45 +478,59 @@ def peaks(pbf):
     for node in fp:
         name = node.tags.get("name")
         if name and node.location.valid():
-            found.append((node.id, node.location.lon, node.location.lat, name))
+            found.append((node.id, node.location.lon, node.location.lat, name, metres(node.tags.get("ele"))))
     return found
 
 
-def write(out, found, scored, rank, county, names):
-    """The shapefiles and jut.tsv: scored, (peak index, kind, base) for each score; rank, each one's rank."""
+def write(out, found, scored, rank, close, county, names, countries):
+    """
+    The shapefiles and jut.tsv: scored, (peak index, kind, base) for each
+    score; rank and close, each one's (see ranks()).
+    """
     to_wgs = pyproj.Transformer.from_crs(27700, 4326, always_xy=True)
     summits = shapefile.Writer(os.path.join(out, "summits"), shapeType=shapefile.POINT)
     lines = shapefile.Writer(os.path.join(out, "lines"), shapeType=shapefile.POLYLINE)
     ends = shapefile.Writer(os.path.join(out, "bases"), shapeType=shapefile.POINT)
     for w in (summits, lines, ends):
-        w.field("kind", "C", size=4)
+        w.field("kind", "C", size=8)
     summits.field("score", "N", size=6)
     summits.field("rank", "N", size=1)
+    summits.field("close", "N", size=1)
+    summits.field("name", "C", size=254)
+    summits.field("ele", "N", size=5)
+    summits.field("county", "C", size=100)
+    summits.field("country", "C", size=8)
+    for w in (lines, ends):
+        w.field("peak_score", "N", size=6)
     rows = []
-    for (i, kind, b), r in zip(scored, rank):
-        osm_id, lon, lat, name = found[i]
+    for (i, kind, b), r, c in zip(scored, rank, close):
+        osm_id, lon, lat, name, ele = found[i]
         s, j, steep, angle, h, d, qe, qn, zp = b
         blon, blat = to_wgs.transform(qe, qn)
+        where = (names[county[i]], countries[county[i]]) if county[i] >= 0 else ("", "")
         summits.point(round(lon, 7), round(lat, 7))
-        summits.record(kind, round(s), int(r))
+        summits.record(kind, round(s), int(r), int(c), name, ele if ele is not None else round(zp), *where)
         lines.line([[[round(lon, 7), round(lat, 7)], [round(blon, 7), round(blat, 7)]]])
-        lines.record(kind)
+        lines.record(kind, round(s))
         ends.point(round(blon, 7), round(blat, 7))
-        ends.record(kind)
-        rows.append((kind, name, osm_id, names[county[i]] if county[i] >= 0 else "", int(r), round(s), round(j),
-                     round(steep, 1), round(angle, 1), round(h), round(d), round(zp), round(lat, 6), round(lon, 6),
-                     round(blat, 6), round(blon, 6)))
+        ends.record(kind, round(s))
+        rows.append((kind, name, osm_id, *where, int(r), int(c), round(s), round(j),
+                     round(steep, 1), round(angle, 1), round(h), round(d), round(zp), "" if ele is None else ele,
+                     round(lat, 6), round(lon, 6), round(blat, 6), round(blon, 6)))
     for w in (summits, lines, ends):
         w.close()
     prj = pyproj.CRS.from_epsg(4326).to_wkt(pyproj.enums.WktVersion.WKT1_ESRI)
     for stem in ("summits", "lines", "bases"):
         with open(os.path.join(out, stem + ".prj"), "w") as f:
             f.write(prj)
-    rows.sort(key=lambda row: (KINDS.index(row[0]), -row[5]))
+        # Planetiler reads the names in the encoding this says, Latin-1 without it: Sgùrr, not SgÃ¹rr.
+        with open(os.path.join(out, stem + ".cpg"), "w") as f:
+            f.write("UTF-8")
+    rows.sort(key=lambda row: (KINDS.index(row[0]), -row[7]))
     with open(os.path.join(out, "jut.tsv"), "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
-        w.writerow(("kind", "name", "osm_id", "county", "rank", "score", "jut", "steepness", "angle", "height_m",
-                    "distance_m", "summit_m", "lat", "lon", "base_lat", "base_lon"))
+        w.writerow(("kind", "name", "osm_id", "county", "country", "rank", "close", "score", "jut", "steepness",
+                    "angle", "height_m", "distance_m", "summit_m", "ele", "lat", "lon", "base_lat", "base_lon"))
         w.writerows(rows)
     return rows
 
@@ -473,12 +544,17 @@ def main():
     os.makedirs(out, exist_ok=True)
     t = time.time()
     ways_path = os.path.join(out, "ways.npy")
-    water_path = os.path.join(out, "water.npy")
+    water_path = os.path.join(out, "water-sizes.npy")
     counties_path = os.path.join(out, "counties.json")
     if newer(ways_path, walking, driving):
         print("    have the paths and roads' grid")
     else:
         rasterize([walking, driving], ways_path)
+    # The grid from before lakes were told apart by size, 2 GB of nothing now: water-sizes.npy is made in its
+    # place, and the counties again with it, now with their countries.
+    stale = os.path.join(out, "water.npy")
+    if os.path.exists(stale):
+        os.remove(stale)
     if newer(water_path, pbf, sea_zip) and newer(counties_path, pbf):
         print("    have the sea and lakes' grid, and the counties")
     else:
@@ -502,20 +578,21 @@ def main():
             if done % 2000 == 0:
                 print(f"\r    {done} of {len(found)} peaks, {left(began, done, len(found))} ", end="", flush=True)
     print()
-    county, names = counties_of(lon, lat, regions_path, counties_path)
-    scored, rank = [], []
+    county, names, countries = counties_of(lon, lat, regions_path, counties_path)
+    scored, rank, close = [], [], []
     for kind in KINDS:
         have = [i for i, r in enumerate(results) if kind in r]
         if not have:
             continue
         idx = np.array(have, dtype=np.int64)
         scored += [(i, kind, results[i][kind]) for i in have]
-        rank += list(ranks(np.column_stack([e[idx], n[idx]]), np.array([results[i][kind][0] for i in have]),
-                           county[idx]))
-    rows = write(out, found, scored, rank, county, names)
+        r, c = ranks(np.column_stack([e[idx], n[idx]]), np.array([results[i][kind][0] for i in have]), county[idx])
+        rank += list(r)
+        close += list(c)
+    rows = write(out, found, scored, rank, close, county, names, countries)
     for kind in KINDS:
         best = [r for r in rows if r[0] == kind]
-        print(f"jut: {len(best)} {kind} scores; highest: " + ", ".join(f"{r[1]} {r[5]}" for r in best[:4]))
+        print(f"jut: {len(best)} {kind} scores; highest: " + ", ".join(f"{r[1]} {r[7]}" for r in best[:4]))
     print(f"jut: done in {time.time() - t:.0f}s")
 
 

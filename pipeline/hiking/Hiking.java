@@ -52,12 +52,17 @@ import java.util.regex.Pattern;
  *                 the app to leave out those in town.
  *   jut           each named peak's scores (pipeline/jut.py): how impressively
  *                 it rises above where someone can stand round it, "kind"
- *                 path (a path or road), sea or lake. For each, a point at
- *                 the summit with its "score" (whole metres) and "rank" (1,
- *                 the highest within 5 km; 2, the highest in its county),
- *                 from zoom 10, the highest ranks and scores first; and from
- *                 zoom 12 a line from the summit to its base, the place it
- *                 rises most from, and a point there, with only "kind".
+ *                 path (a path or road), sea, or lake, lake10 or lake50 (a
+ *                 lake of 1, 10 or 50 hectares or more). For each, a point
+ *                 at the summit with its "score" (whole metres), "rank" (1,
+ *                 the highest within 5 km; 2, the highest in its county,
+ *                 with none higher within 15 km over its border either),
+ *                 "close" (1, within a tenth of the highest within 5 km),
+ *                 and the peak's "name", "ele", "county" and "country" (for
+ *                 the app's list of them), from zoom 8, the highest ranks
+ *                 and scores first; and from zoom 12 a line from the summit
+ *                 to its base, the place it rises most from, and a point
+ *                 there, with "kind" and "peak_score", the summit's score.
  *
  *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --jut=<dir> --parking=<tsv> --output=...
  */
@@ -110,15 +115,22 @@ public class Hiking implements Profile {
       if (sf.hasTag("score")) {
         long score = sf.getLong("score");
         long rank = sf.getLong("rank");
+        long close = sf.getLong("close");
         features.point("jut")
           .setAttr("kind", kind)
           .setAttr("score", score)
           .setAttr("rank", rank > 0 ? rank : null)
-          .setSortKey((int) -(rank * 100_000 + Math.min(score, 99_999)))
-          .setMinZoom(10);
+          .setAttr("close", close > 0 ? 1 : null)
+          .setAttr("name", sf.getString("name"))
+          .setAttr("ele", sf.getLong("ele"))
+          .setAttr("county", blankless(sf.getString("county")))
+          .setAttr("country", blankless(sf.getString("country")))
+          .setSortKey((int) -(rank * 200_000 + close * 100_000 + Math.min(score, 99_999)))
+          .setMinZoom(8);
       } else {
         (sf.isPoint() ? features.point("jut") : features.line("jut"))
           .setAttr("kind", kind)
+          .setAttr("peak_score", sf.getLong("peak_score"))
           .setMinZoom(12)
           .setMinPixelSize(0);
       }
@@ -297,6 +309,11 @@ public class Hiking implements Profile {
       case "donation", "donations" -> "donation";
       default -> fee.matches(".*\\d\\d:\\d\\d.*") ? "times" : null;
     };
+  }
+
+  /** A shapefile's text, null for none: its blanks are "". */
+  static String blankless(String text) {
+    return text == null || text.isBlank() ? null : text;
   }
 
   static Integer metres(String ele) {

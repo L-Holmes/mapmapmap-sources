@@ -145,7 +145,7 @@ step 7 $STEPS "Driving graph" "about 15 minutes"
 $PY -u pipeline/graph.py build-driving "$SRC/united-kingdom.osm.pbf" "$WORK/terrain/dem.npy" "$WORK/driving.npz"
 $PY -u pipeline/graph.py cut "$WORK/driving.npz" "$WORK/regions.json" "$OUT"
 
-step 8 $STEPS "Peak scores: how each peak rises above the paths, roads, sea and lakes round it" "about 10 minutes"
+step 8 $STEPS "Peak scores: how each peak rises above the paths, roads, sea and lakes (three sizes) round it" "10 to 15 minutes"
 $PY -u pipeline/jut.py "$SRC/united-kingdom.osm.pbf" "$SRC/sources/water-polygons-split-3857.zip" "$WORK/regions.json" \
   "$WORK/terrain/heights.npy" "$WORK/graph.npz" "$WORK/driving.npz" "$WORK/jut"
 
