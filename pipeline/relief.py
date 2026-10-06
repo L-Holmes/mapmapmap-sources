@@ -3,15 +3,23 @@
 The hiking map's relief, as two sets of raster tiles: hill shading, and
 steep ground.
 
-    relief.py <heights.npy> <shade.mbtiles> <slope.mbtiles> <west,south,east,north>
+    relief.py <heights.npy> <shade.mbtiles> <slope.mbtiles> <west,south,east,north> [<regions.json> <area>]
 
-First, for every 20 m cell of the height grid (pipeline/lidar.py: the
-Environment Agency's LIDAR in England, OS Terrain 50 elsewhere), its slope
+First, for every cell of the height grid (pipeline/lidar.py, 20 m: the
+Environment Agency's LIDAR in England, OS Terrain 50 elsewhere in Great
+Britain; pipeline/copernicus.py, 25 or 30 m, the Copernicus DEM, in the
+other areas; pipeline/grid.py says where each lies), its slope
 (Horn's 3x3 gradient) and how it is lit: from the north-west, 45° up,
 heights half as much again so that lowland hills show. Kept beside the
 grid as slope.npy (quarter degrees) and light.npy (-127, facing away from
 the light, to 127, facing into it; flat ground 0), and made again only
-when the grid is newer.
+when the grid, or this script, is newer. The Copernicus DEM's heights
+are blurred by a cell's Gaussian first (pipeline/grid.py's "smooth"): it
+is a surface model, and its woods and roofs would come out as a speckle
+of steep ground, where the bands should follow the lie of the land. (On
+a grid other than OSGB's, its north is a few degrees off true north away
+from its middle, up to 12° at Norway's edges, and the light with it: not
+so as to notice.)
 
 Then the tiles, each pixel taking the cells round it, bilinearly:
 
@@ -31,7 +39,8 @@ Then the tiles, each pixel taking the cells round it, bilinearly:
             Terrain 50's, which evens out short steep ground, it is most
             of what shows.
 
-Flat ground is neither, so the map shows through. The app draws both
+Given an area's regions, only tiles touching them are made; else every
+tile in the bounds. Flat ground is neither, so the map shows through. The app draws both
 larger above their top zoom. The zooms below are their children averaged,
 four pixels to one (the slope's, the steepest of the four). A tile with
 nothing on it (the sea, the flat) is left out.
@@ -47,16 +56,13 @@ import time
 from multiprocessing import Pool
 
 import numpy as np
-import pyproj
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(__file__))
+from grid import Grid  # noqa: E402
 from progress import left  # noqa: E402
 from tiles import create  # noqa: E402
 
-CELL = 20
-# The grid's sea, in its decimetres.
-SEA = -25
 BOTTOM = 8
 SHADE_TOP, SLOPE_TOP = 12, 14
 # Each worker makes the tiles under one of these, and hands them back for
@@ -86,32 +92,45 @@ ALPHA_STEP = 2
 
 
 def derive(dem_path):
-    """slope.npy and light.npy beside the grid, made again only if it is newer."""
+    """slope.npy and light.npy beside the grid, made again only if it, or this script, is newer."""
     folder = os.path.dirname(dem_path)
     slope_path, light_path = os.path.join(folder, "slope.npy"), os.path.join(folder, "light.npy")
-    if all(os.path.exists(p) and os.path.getmtime(p) >= os.path.getmtime(dem_path) for p in (slope_path, light_path)):
+    since = max(os.path.getmtime(dem_path), os.path.getmtime(__file__))
+    if all(os.path.exists(p) and os.path.getmtime(p) >= since for p in (slope_path, light_path)):
         return slope_path, light_path
     t = time.time()
+    g = Grid.of(dem_path)
     dem = np.load(dem_path, mmap_mode="r")
     rows, cols = dem.shape
+    # Both 0 where nothing is written: flat, which is what the sea is, and on
+    # disk no room.
     slope = np.lib.format.open_memmap(slope_path + ".part", mode="w+", dtype=np.uint8, shape=dem.shape)
     light = np.lib.format.open_memmap(light_path + ".part", mode="w+", dtype=np.int8, shape=dem.shape)
     lx = math.sin(AZIMUTH) * math.cos(ALTITUDE)
     ly = math.cos(AZIMUTH) * math.cos(ALTITUDE)
     lz = math.sin(ALTITUDE)
     chunk = 1000
+    # Rows more each way for the blur to see past a chunk's edges.
+    m = 4 * int(np.ceil(g.smooth))
     for r0 in range(0, rows, chunk):
         r1 = min(rows, r0 + chunk)
         # A row of overlap each way, the edges of the grid repeated.
         a, b = max(0, r0 - 1), min(rows, r1 + 1)
-        z = np.asarray(dem[a:b], dtype=np.float32) / 10
+        z = np.asarray(dem[max(0, a - m):b + m], dtype=np.float32)
+        if z.max() <= g.sea:
+            continue
+        z *= g.scale
+        if g.smooth:
+            from scipy.ndimage import gaussian_filter
+            z = gaussian_filter(z, g.smooth, mode="nearest")
+        z = z[a - max(0, a - m):a - max(0, a - m) + b - a]
         z = np.pad(z, ((1 if r0 == 0 else 0, 1 if r1 == rows else 0), (1, 1)), mode="edge")
         # Row 0 is the south: up a row is north.
         nw, n, ne = z[2:, :-2], z[2:, 1:-1], z[2:, 2:]
         w, e = z[1:-1, :-2], z[1:-1, 2:]
         sw, s, se = z[:-2, :-2], z[:-2, 1:-1], z[:-2, 2:]
-        dx = ((ne + 2 * e + se) - (nw + 2 * w + sw)) / (8 * CELL)
-        dy = ((nw + 2 * n + ne) - (sw + 2 * s + se)) / (8 * CELL)
+        dx = ((ne + 2 * e + se) - (nw + 2 * w + sw)) / (8 * g.cell)
+        dy = ((nw + 2 * n + ne) - (sw + 2 * s + se)) / (8 * g.cell)
         slope[r0:r1] = np.clip(np.degrees(np.arctan(np.hypot(dx, dy))) * 4 + 0.5, 0, 255).astype(np.uint8)
         nx, ny = -EXAGGERATION * dx, -EXAGGERATION * dy
         lit = (nx * lx + ny * ly + lz) / np.sqrt(nx * nx + ny * ny + 1)
@@ -134,7 +153,8 @@ def grids(slope_path, light_path, dem_path):
         GRIDS["slope"] = np.load(slope_path, mmap_mode="r")
         GRIDS["light"] = np.load(light_path, mmap_mode="r")
         GRIDS["dem"] = np.load(dem_path, mmap_mode="r")
-        GRIDS["osgb"] = pyproj.Transformer.from_crs(4326, 27700, always_xy=True)
+        GRIDS["grid"] = Grid.of(dem_path)
+        GRIDS["to_grid"] = GRIDS["grid"].to_grid()
     return GRIDS
 
 
@@ -164,13 +184,14 @@ def cells(g, z, x, y):
     lon = (x + u) / n * 360 - 180
     lat = np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * (y + u) / n))))
     lon, lat = np.meshgrid(lon, lat)
-    e, north = g["osgb"].transform(lon, lat)
-    c = (e - CELL / 2) / CELL
-    r = (north - CELL / 2) / CELL
+    e, north = g["to_grid"].transform(lon, lat)
+    grid = g["grid"]
+    c = (e - grid.x0 - grid.cell / 2) / grid.cell
+    r = (north - grid.y0 - grid.cell / 2) / grid.cell
     dem = g["dem"]
     r0, r1 = int(max(0, r.min())), int(min(dem.shape[0], r.max() + 2))
     c0, c1 = int(max(0, c.min())), int(min(dem.shape[1], c.max() + 2))
-    if r0 >= r1 or c0 >= c1 or float(np.asarray(dem[r0:r1, c0:c1]).max()) <= SEA:
+    if r0 >= r1 or c0 >= c1 or float(np.asarray(dem[r0:r1, c0:c1]).max()) <= grid.sea:
         return None
     return r, c
 
@@ -283,8 +304,8 @@ def pyramid(job):
 class Output:
     """An mbtiles file being written, its tiles stored once however often they repeat."""
 
-    def __init__(self, path, kind, top, bounds):
-        self.path, self.kind, self.top, self.bounds = path, kind, top, bounds
+    def __init__(self, path, kind, top, bounds, source):
+        self.path, self.kind, self.top, self.bounds, self.source = path, kind, top, bounds, source
         self.db = create(path + ".part")
         self.ids = {}
         self.count = self.size = 0
@@ -302,8 +323,8 @@ class Output:
         what = "Hill shading" if self.kind == "shade" else "Steep ground: from 25°, 30°, 38° and 45°"
         meta = {
             "name": self.kind, "format": "webp", "type": "overlay", "version": "1",
-            "description": f"{what}, from OS Terrain 50",
-            "attribution": "Contains OS data © Crown copyright and database right",
+            "description": f"{what}, from {self.source}",
+            "attribution": credit(self.source),
             "minzoom": str(BOTTOM), "maxzoom": str(self.top), "bounds": self.bounds,
         }
         self.db.executemany("INSERT INTO metadata VALUES (?, ?)", meta.items())
@@ -311,6 +332,13 @@ class Output:
         self.db.close()
         os.replace(self.path + ".part", self.path)
         print(f"{self.kind}: {self.count} tiles, {os.path.getsize(self.path) / 1e6:.0f} MB")
+
+
+def credit(source):
+    if "Copernicus" in source:
+        from areas import COPERNICUS_CREDIT
+        return COPERNICUS_CREDIT[0].upper() + COPERNICUS_CREDIT[1:]
+    return "Contains OS data © Crown copyright and database right"
 
 
 def main():
@@ -323,7 +351,16 @@ def main():
     y0 = int((1 - math.asinh(math.tan(math.radians(north))) / math.pi) / 2 * n)
     y1 = int((1 - math.asinh(math.tan(math.radians(south))) / math.pi) / 2 * n)
     jobs = [(paths, x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
-    outputs = {"shade": Output(shade_path, "shade", SHADE_TOP, bounds), "slope": Output(slope_path, "slope", SLOPE_TOP, bounds)}
+    if len(sys.argv) > 6:
+        import shapely
+        from regions import outline
+        from tiles import tile_bounds
+        area = outline(sys.argv[5], sys.argv[6], 0.02)
+        shapely.prepare(area)
+        jobs = [j for j in jobs if area.intersects(shapely.box(*tile_bounds(JOB, j[1], j[2])))]
+    source = Grid.of(heights_path).source
+    outputs = {"shade": Output(shade_path, "shade", SHADE_TOP, bounds, source),
+               "slope": Output(slope_path, "slope", SLOPE_TOP, bounds, source)}
     levels = {kind: {} for kind in outputs}
     began = time.time()
     with Pool() as pool:

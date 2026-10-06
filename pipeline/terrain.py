@@ -12,6 +12,8 @@ Writes:
 
 The grid is what the routing graph samples for ascent; the contours are a
 source for the hiking layers' Planetiler run (see pipeline/hiking/Hiking.java).
+contours() draws them from any grid (pipeline/grid.py): pipeline/copernicus.py
+draws the other areas' with it.
 """
 import io
 import os
@@ -25,11 +27,13 @@ import pyproj
 import shapefile
 import shapely
 
+sys.path.insert(0, os.path.dirname(__file__))
+from grid import Grid  # noqa: E402
+
 CELL = 50
 COLS = 700_000 // CELL
 ROWS = 1_300_000 // CELL
 SEA = -2.5
-CHUNK = 100_000 // CELL
 INTERVAL = 10
 INDEX = 50
 # Contours are simplified in OSGB metres before they are written. Well
@@ -77,22 +81,33 @@ def build_dem(zip_path, out):
 
 
 def contour_chunk(args):
-    out, ci, cj = args
-    dem = np.load(os.path.join(out, "dem.npy"), mmap_mode="r")
-    r0, c0 = ci * CHUNK, cj * CHUNK
-    # One cell of overlap each way, so lines meet the next square's exactly.
-    block = np.asarray(dem[r0:r0 + CHUNK + 1, c0:c0 + CHUNK + 1], dtype=np.float64)
+    grid_path, out, ci, cj, interval, index, smooth, least = args
+    g = Grid.of(grid_path)
+    dem = np.load(grid_path, mmap_mode="r")
+    chunk = round(100_000 / g.cell)
+    r0, c0 = ci * chunk, cj * chunk
+    # One cell of overlap each way, so lines meet the next square's exactly;
+    # smoothed, with more round it, so they are smoothed the same either side.
+    m = 3 * int(np.ceil(smooth)) if smooth else 0
+    a0, b0 = max(r0 - m, 0), max(c0 - m, 0)
+    block = np.asarray(dem[a0:r0 + chunk + 1 + m, b0:c0 + chunk + 1 + m], dtype=np.float64) * g.scale
+    if smooth:
+        from scipy.ndimage import gaussian_filter
+        block = gaussian_filter(block, smooth, mode="nearest")
+    block = block[r0 - a0:r0 - a0 + chunk + 1, c0 - b0:c0 - b0 + chunk + 1]
+    if not block.size:
+        return 0
     top = float(block.max())
-    if top < INTERVAL:
+    if top < interval:
         return 0
     gen = contourpy.contour_generator(z=block, line_type=contourpy.LineType.Separate)
-    to_wgs = pyproj.Transformer.from_crs(27700, 4326, always_xy=True)
-    path = os.path.join(out, "contours", f"c_{ci:02d}_{cj:02d}")
+    to_wgs = g.to_wgs()
+    path = os.path.join(out, f"c_{ci:02d}_{cj:02d}")
     count = 0
     with shapefile.Writer(path, shapeType=shapefile.POLYLINE) as w:
         w.field("ele", "N", size=5)
         w.field("idx", "N", size=1)
-        for level in range(INTERVAL, int(top) + 1, INTERVAL):
+        for level in range(interval, int(top) + 1, interval):
             lines = gen.lines(level)
             if not lines:
                 continue
@@ -100,25 +115,37 @@ def contour_chunk(args):
             for xy in lines:
                 if len(xy) < 2:
                     continue
-                e = (c0 + xy[:, 0]) * CELL + CELL / 2
-                n = (r0 + xy[:, 1]) * CELL + CELL / 2
+                # A ring this short is a bump in the heights, not a hill.
+                if least and np.allclose(xy[0], xy[-1]) and np.hypot(*np.diff(xy, axis=0).T).sum() < least:
+                    continue
+                e = g.x0 + (c0 + xy[:, 0]) * g.cell + g.cell / 2
+                n = g.y0 + (r0 + xy[:, 1]) * g.cell + g.cell / 2
                 geoms.append(shapely.linestrings(np.column_stack([e, n])))
-            for g in shapely.simplify(np.array(geoms, dtype=object), SIMPLIFY_M):
-                coords = shapely.get_coordinates(g)
+            for line in shapely.simplify(np.array(geoms, dtype=object), SIMPLIFY_M):
+                coords = shapely.get_coordinates(line)
                 if len(coords) < 2:
                     continue
                 lon, lat = to_wgs.transform(coords[:, 0], coords[:, 1])
                 w.line([np.column_stack([lon, lat]).round(7).tolist()])
-                w.record(level, 1 if level % INDEX == 0 else 0)
+                w.record(level, 1 if level % index == 0 else 0)
                 count += 1
     with open(path + ".prj", "w") as f:
         f.write(pyproj.CRS.from_epsg(4326).to_wkt(pyproj.enums.WktVersion.WKT1_ESRI))
     return count
 
 
-def build_contours(out):
-    os.makedirs(os.path.join(out, "contours"), exist_ok=True)
-    jobs = [(out, ci, cj) for ci in range(ROWS // CHUNK) for cj in range(COLS // CHUNK)]
+def contours(grid_path, out, interval=INTERVAL, index=INDEX, smooth=0.0, least=0):
+    """
+    Contour lines from a grid into <out>, one shapefile per 100 km square:
+    every [interval] metres, [index] marking every so many. [smooth]: the
+    heights first blurred by a Gaussian of that many cells; [least]: rings
+    shorter than so many cells left out.
+    """
+    os.makedirs(out, exist_ok=True)
+    g = Grid.of(grid_path)
+    chunk = round(100_000 / g.cell)
+    jobs = [(grid_path, out, ci, cj, interval, index, smooth, least)
+            for ci in range(-(-g.rows // chunk)) for cj in range(-(-g.cols // chunk))]
     with Pool() as pool:
         total = sum(pool.imap_unordered(contour_chunk, jobs))
     print(f"contours: {total} lines")
@@ -128,7 +155,7 @@ def main():
     zip_path, out = sys.argv[1], sys.argv[2]
     os.makedirs(out, exist_ok=True)
     build_dem(zip_path, out)
-    build_contours(out)
+    contours(os.path.join(out, "dem.npy"), os.path.join(out, "contours"))
 
 
 if __name__ == "__main__":

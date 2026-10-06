@@ -4,13 +4,15 @@ The walking and driving graphs: every way a walker, or a car, can use,
 split at junctions, with a cost per direction, cut into one file per
 download region.
 
-    graph.py build <osm.pbf> <dem.npy> <out.npz>
-    graph.py build-driving <osm.pbf> <dem.npy> <out.npz>
-    graph.py cut <graph.npz> <regions.json> <out dir>
+    graph.py build <osm.pbf> <heights.npy> <out.npz>
+    graph.py build-driving <osm.pbf> <heights.npy> <out.npz>
+    graph.py cut <graph.npz> <regions.json> <area> <out dir>
 
-build reads Great Britain once. cut writes <out dir>/<region>.graph for
-each region (<region>.driving.graph for a driving graph): the edges within
-~2 km of its outline, in the binary format the app reads (the app's
+build reads an area's extract once, its climbs from its height grid
+(pipeline/grid.py: Great Britain's OS Terrain 50, the other areas' the
+Copernicus DEM). cut writes <out dir>/<region>.graph for each of the
+area's regions (<region>.driving.graph for a driving graph): the edges
+within ~2 km of its outline, in the binary format the app reads (the app's
 routing/Graph.kt, which documents it). Node ids are global, so graphs of
 neighbouring regions join where they meet.
 
@@ -31,7 +33,6 @@ directions: its number and name ("A59", "Whalley Road"), its kind (ROAD
 below) and whether it is part of a roundabout. These follow the file's last
 section, where an app that does not read them never looks.
 """
-import json
 import os
 import sys
 import time
@@ -40,7 +41,9 @@ from array import array
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
+from grid import Grid  # noqa: E402
 from progress import left  # noqa: E402
+from regions import of  # noqa: E402
 
 CLIMB = 8.0
 # The factor for each kind of way. None of these are below 1, which is what
@@ -72,6 +75,13 @@ FERRY_KMH = 20
 NATIONAL = {
     "gb:nsl_single": 96, "uk:nsl_single": 96, "national": 96,
     "gb:nsl_dual": 112, "uk:nsl_dual": 112, "gb:motorway": 112, "uk:motorway": 112,
+}
+# A country's limit by the kind of road, where that is mapped in place of a
+# number ("IT:rural"), km/h: in towns 50 in all of them.
+ZONES = {
+    "rural": {"it": 90, "no": 80, "at": 100, "ch": 80, "de": 100, "fr": 80, "si": 90, "li": 80, "mc": 50},
+    "trunk": {"it": 110, "ch": 100, "si": 110, "fr": 110},
+    "motorway": {"it": 130, "no": 110, "at": 130, "ch": 120, "de": 130, "fr": 130, "si": 130},
 }
 NO_CARS = {"no", "private", "agricultural", "forestry", "delivery", "emergency"}
 ONEWAY = {"yes", "true", "1"}
@@ -129,6 +139,11 @@ def limit(tags):
     v = (tags.get("maxspeed") or "").strip().lower()
     if v in NATIONAL:
         return NATIONAL[v]
+    country, _, zone = v.partition(":")
+    if zone == "urban":
+        return 50
+    if zone in ZONES:
+        return ZONES[zone].get(country)
     try:
         return float(v[:-3]) * 1.609 if v.endswith("mph") else float(v)
     except ValueError:
@@ -183,18 +198,22 @@ def road_kind(tags):
     return kind
 
 
-def elevation(dem, lat_e7, lon_e7):
-    """Heights in decimetres, bilinear from the OS Terrain 50 grid."""
-    import pyproj
-    to_osgb = pyproj.Transformer.from_crs(4326, 27700, always_xy=True)
-    e, n = to_osgb.transform(lon_e7 / 1e7, lat_e7 / 1e7)
-    c = np.clip((e - 25.0) / 50.0, 0, dem.shape[1] - 1.001)
-    r = np.clip((n - 25.0) / 50.0, 0, dem.shape[0] - 1.001)
+def elevation(dem, grid, lat_e7, lon_e7):
+    """Heights in decimetres, bilinear from the height grid."""
+    e, n = grid.to_grid().transform(lon_e7 / 1e7, lat_e7 / 1e7)
+    c = np.clip((e - grid.x0 - grid.cell / 2) / grid.cell, 0, dem.shape[1] - 1.001)
+    r = np.clip((n - grid.y0 - grid.cell / 2) / grid.cell, 0, dem.shape[0] - 1.001)
     c0, r0 = c.astype(np.int64), r.astype(np.int64)
     fc, fr = c - c0, r - r0
-    z = (dem[r0, c0] * (1 - fc) * (1 - fr) + dem[r0, c0 + 1] * fc * (1 - fr)
-         + dem[r0 + 1, c0] * (1 - fc) * fr + dem[r0 + 1, c0 + 1] * fc * fr)
-    return np.round(np.maximum(z, 0) * 10).astype(np.int16)
+    out = np.empty(len(c), np.int16)
+    # In pieces: a grid's cells are read as floats, and a graph has millions of points.
+    for a in range(0, len(c), 5_000_000):
+        s = slice(a, a + 5_000_000)
+        i, j, x, y = r0[s], c0[s], fc[s], fr[s]
+        z = (dem[i, j] * (1 - x) * (1 - y) + dem[i, j + 1] * x * (1 - y)
+             + dem[i + 1, j] * (1 - x) * y + dem[i + 1, j + 1] * x * y) * grid.scale
+        out[s] = np.round(np.maximum(z, 0) * 10).astype(np.int16)
+    return out
 
 
 def seg_lengths(lat, lon):
@@ -288,7 +307,8 @@ def build(pbf, dem_path, out, driving=False):
     g_lat, g_lon = lat[idx], lon[idx]
 
     dem = np.load(dem_path, mmap_mode="r")
-    g_ele = elevation(dem, g_lat, g_lon).astype(np.float32) / 10
+    grid = Grid.of(dem_path)
+    g_ele = elevation(dem, grid, g_lat, g_lon).astype(np.float32) / 10
     seg = seg_lengths(g_lat, g_lon)
     rise = np.diff(g_ele)
     # Segments that run from one edge into the next are not segments.
@@ -335,7 +355,7 @@ def build(pbf, dem_path, out, driving=False):
     s_lon = np.round(coords[:, 0] * 1e7).astype(np.int32)
     s_offs = np.zeros(len(a) + 1, dtype=np.int64)
     np.cumsum(np.bincount(which, minlength=len(a)), out=s_offs[1:])
-    s_ele = elevation(dem, s_lat, s_lon)
+    s_ele = elevation(dem, grid, s_lat, s_lon)
     print(f"{len(node_lat)} nodes, {len(g_lat)} -> {len(s_lat)} points in {time.time() - t:.0f}s")
 
     roads = {}
@@ -362,7 +382,7 @@ def build(pbf, dem_path, out, driving=False):
     )
 
 
-def cut(npz_path, regions_path, out_dir):
+def cut(npz_path, regions_path, area, out_dir):
     import shapely
     from shapely.geometry import shape
     os.makedirs(out_dir, exist_ok=True)
@@ -399,7 +419,7 @@ def cut(npz_path, regions_path, out_dir):
     lines = shapely.linestrings(np.column_stack([lon[idx] / 1e7, lat[idx] / 1e7]), indices=np.repeat(np.arange(len(kept)), n_pts))
     tree = shapely.STRtree(lines)
     suffix = ".driving.graph" if speed else ".graph"
-    regions = json.load(open(regions_path))
+    regions = of(regions_path, area)
     began = time.time()
     for i, region in enumerate(regions, 1):
         t = time.time()
@@ -503,7 +523,7 @@ def main():
     elif sys.argv[1] == "build-driving":
         build(*sys.argv[2:5], driving=True)
     elif sys.argv[1] == "cut":
-        cut(*sys.argv[2:5])
+        cut(*sys.argv[2:6])
     else:
         sys.exit(__doc__)
 

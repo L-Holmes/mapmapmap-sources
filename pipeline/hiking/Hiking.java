@@ -30,8 +30,10 @@ import java.util.regex.Pattern;
  *                 trail visibility, "private" access that shuts walkers out.
  *   hiking_route  waymarked routes, from route relations: "network" is
  *                 nwn, rwn or lwn, with the route's name and ref.
- *   contour       10 m contours from OS Terrain 50 (pipeline/terrain.py), "idx"
- *                 on every 50 m.
+ *   contour       contours (pipeline/terrain.py): every 10 m from OS Terrain
+ *                 50 in Great Britain, "idx" on every 50 m; every 20 m from the
+ *                 Copernicus DEM elsewhere (pipeline/copernicus.py), "idx" on
+ *                 every 100 m.
  *   feature       named places a walk is named after that OpenMapTiles
  *                 leaves out: "class" waterfall (a point) or valley (a
  *                 point, line or area, as mapped), and its "name". Not

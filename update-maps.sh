@@ -2,15 +2,17 @@
 #
 # Update the maps everyone downloads.
 #
-#   ./update-maps.sh           finish an interrupted upload; otherwise, if
+#   ./update-maps.sh           finish an interrupted upload, or carry on an
+#                              interrupted build; otherwise, if
 #                              OpenStreetMap has newer data than what is
 #                              published, or the pipeline has changed since,
 #                              rebuild every region and publish it
 #   ./update-maps.sh --force   rebuild and publish even if nothing is newer
 #
 # Run it by hand whenever the maps should catch up with OpenStreetMap
-# (monthly is plenty). A full run is about two hours of building, then
-# uploading ~12 GB (an hour at 3 MB/s, four on a slow line); it says what it is doing and how long each
+# (monthly is plenty). A full run is about three hours of building (Great
+# Britain, then Italy), then uploading ~18 GB (under two hours at 3 MB/s,
+# more on a slow line); it says what it is doing and how long each
 # part usually takes. No app release is needed: apps see the new data the
 # next time they check, and offer each region's update. Needs Java 21+, uv
 # and a logged-in GitHub CLI; see README.md.
@@ -23,7 +25,7 @@ FORCE=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 1 ;;
   esac
 done
@@ -42,9 +44,16 @@ publish() {
   VERSION=$(python3 -c "import json; print(json.load(open('$OUT/catalog.json'))['version'])")
   TAG="maps-$VERSION"
   LIMIT=$((2 * 1024 * 1024 * 1024))
-  # The regions, and the two files the app ships and refreshes from here: the
-  # region outlines and the low-zoom overview (which *.mbtiles includes).
-  FILES=("$OUT/catalog.json" "$OUT"/*.mbtiles "$OUT"/*.graph "$OUT/app-regions.json")
+  # The catalogue, the regions' files it lists, and the two files the app
+  # ships and refreshes from here, the region outlines and the low-zoom
+  # overview: just those, whatever else is in data/out.
+  mapfile -t FILES < <(python3 -c "
+import json, sys
+out = sys.argv[1]
+c = json.load(open(out + '/catalog.json'))
+print(out + '/catalog.json')
+for name in [f['name'] for r in c['regions'] for f in r['files']] + [f['name'] for f in c.get('assets', [])]:
+    print(out + '/' + name)" "$OUT")
   for f in "${FILES[@]}"; do
     size=$(stat -c %s "$f")
     if (( size >= LIMIT )); then
@@ -72,11 +81,11 @@ publish() {
   if [[ "$IS_DRAFT" != "true" ]]; then
     # Made as a draft and only published once every file is up, so no app
     # ever sees a catalogue whose files are still uploading.
-    NOTES="Map data for Great Britain from OpenStreetMap, OS Terrain 50 and the Environment Agency's LIDAR; version $VERSION (the data's date, and the pipeline's revision).
+    NOTES="Map data for Great Britain and Italy, from OpenStreetMap; heights from OS Terrain 50 and the Environment Agency's LIDAR in Great Britain, and the Copernicus DEM in Italy; version $VERSION (Great Britain's data's date, and the pipeline's revision).
 
 Each region is five files: \`<region>.mbtiles\` (vector map tiles), \`<region>.graph\` (the walking graph the app routes on), \`<region>.driving.graph\` (the driving graph), and \`<region>.shade.mbtiles\` and \`<region>.slope.mbtiles\` (raster tiles of hill shading, and of steep ground). \`catalog.json\` lists them with their sizes and SHA-256. \`overview.mbtiles\` and \`app-regions.json\` are what the app ships inside itself.
 
-© OpenStreetMap contributors, available under the Open Database Licence. Contains OS data © Crown copyright and database right. Contains Environment Agency LIDAR data © Environment Agency copyright and/or database right, under the Open Government Licence v3.0."
+© OpenStreetMap contributors, available under the Open Database Licence. Contains OS data © Crown copyright and database right. Contains Environment Agency LIDAR data © Environment Agency copyright and/or database right, under the Open Government Licence v3.0. Heights in Italy produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved."
     gh release create "$TAG" --repo "$REPO" --draft --title "Maps $VERSION" --notes "$NOTES"
   fi
 
@@ -174,7 +183,10 @@ Each region is five files: \`<region>.mbtiles\` (vector map tiles), \`<region>.g
   gh release edit "$TAG" --repo "$REPO" --draft=false --latest
 
   echo "==> Keeping the newest $KEEP releases"
-  gh release list --repo "$REPO" --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName' \
+  # By when each was published: their creation times are their tags', which
+  # can be the same for two.
+  gh release list --repo "$REPO" --limit 100 --json tagName,publishedAt,isDraft \
+    --jq '[.[] | select(.isDraft | not)] | sort_by(.publishedAt) | reverse | .[].tagName' \
     | tail -n +$((KEEP + 1)) \
     | while read -r old; do
         echo "    deleting $old"
@@ -193,11 +205,50 @@ gh auth status >/dev/null 2>&1 || { echo "error: the GitHub CLI is not logged in
 # invisible to the app, until every file is up.
 BUILT=$(python3 -c "import json; print(json.load(open('data/out/catalog.json'))['version'])" 2>/dev/null || true)
 DRAFT=$(gh release list --repo "$REPO" --json tagName,isDraft --jq '.[] | select(.isDraft) | .tagName' | head -1)
-if [[ -n "$DRAFT" && "$DRAFT" == "maps-$BUILT" ]]; then
+if [[ -n "$DRAFT" && "$DRAFT" == "maps-$BUILT" && "$BUILT" == *".$(revision)" ]]; then
   echo "==> An upload of $DRAFT stopped partway; finishing it"
   publish
   # That is this run's job done: apps have the maps now. Anything newer
   # waits for the next run, rather than hours more building on the back of it.
+  echo
+  echo "==> Maps updated in $(elapsed). Run this again to check for anything newer."
+  exit 0
+fi
+
+# Any other draft is an upload left unfinished of maps this pipeline no
+# longer makes (it has changed since): it goes, rather than ever being
+# finished, or counted among the releases kept.
+for old in $(gh release list --repo "$REPO" --json tagName,isDraft --jq '.[] | select(.isDraft) | .tagName'); do
+  echo "==> Dropping $old: an upload left unfinished, of maps this pipeline no longer makes"
+  gh release delete "$old" --repo "$REPO" --yes --cleanup-tag
+done
+
+# Temporary files on the data disk, not in /tmp, which may be memory (a
+# tmpfs): the peak scores unpack the sea's polygons there, 1.3 GB, and a
+# worker ended with its job leaves its copy behind. Emptied every run.
+export TMPDIR="$PWD/data/tmp"
+rm -rf "$TMPDIR"
+mkdir -p "$TMPDIR"
+
+# A build that stopped partway (some of its areas built, from the data here,
+# by this pipeline; or all of them, but not its catalogue) carries on with
+# that data: fetching newer, which Geofabrik has every day, would start
+# every area over.
+DONE=0
+AREAS=0
+UNFINISHED=0
+for area in $(data/.venv/bin/python pipeline/areas.py ids 2>/dev/null); do
+  AREAS=$((AREAS + 1))
+  eval "$(data/.venv/bin/python pipeline/areas.py shell "$area")"
+  if [[ "$(cat "data/work/$area/built" 2>/dev/null)" == "$(revision) $(cat "data/src/$STEM.name" 2>/dev/null)" ]]; then
+    DONE=$((DONE + 1))
+    [[ "data/work/$area/built" -nt data/out/catalog.json ]] && UNFINISHED=1
+  fi
+done
+if (( DONE > 0 && (DONE < AREAS || UNFINISHED) )); then
+  echo "==> A build stopped partway, with $DONE of its $AREAS areas built: carrying on from there, with the same map data"
+  pipeline/build.sh
+  publish
   echo
   echo "==> Maps updated in $(elapsed). Run this again to check for anything newer."
   exit 0

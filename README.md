@@ -2,7 +2,7 @@
 
 The map data the [mapmapmap](https://github.com/L-Holmes/APP-map-map-map)
 Android app downloads: offline hiking maps, and walking and driving route
-graphs, for Great Britain, and the pipeline that builds them.
+graphs, for Great Britain and Italy, and the pipeline that builds them.
 
 The files are not in the git history. Each **release** holds a full set of
 regions, and the app always reads the newest:
@@ -17,13 +17,25 @@ https://github.com/L-Holmes/mapmapmap-sources/releases/latest/download/catalog.j
 | `<region>.mbtiles` | Vector map tiles, zooms 8 to 14: roads, paths, public rights of way, waymarked routes, 10 m contours, land and water, car parks with their spaces and fees, each named peak's score and the place it is seen best from, and named waterfalls and valleys (for the app to name walks by) |
 | `<region>.graph` | The walking graph the app plans routes on |
 | `<region>.driving.graph` | The driving graph the app plans car routes on |
-| `<region>.shade.mbtiles`, `<region>.slope.mbtiles` | The hiking map's relief, raster tiles: hill shading (zooms 8 to 12), and steep ground in bands from 25° (zooms 8 to 14); from the Environment Agency's LIDAR in England, OS Terrain 50 elsewhere |
-| `overview.mbtiles`, `app-regions.json` | What the app ships inside itself: zooms 0 to 7 everywhere, and the region outlines. The app repository's `tools/refresh-assets.sh` copies them in. |
+| `<region>.shade.mbtiles`, `<region>.slope.mbtiles` | The hiking map's relief, raster tiles: hill shading (zooms 8 to 12), and steep ground in bands from 25° (zooms 8 to 14); from the Environment Agency's LIDAR in England, OS Terrain 50 elsewhere in Great Britain, the Copernicus DEM everywhere else |
+| `overview.mbtiles`, `app-regions.json` | What the app ships inside itself: zooms 0 to 7 everywhere, and the region outlines. The app repository's `tools/refresh-assets.sh` copies them in; the catalogue lists them too (`assets`), and an app with other copies fetches these, so new regions and the low zooms reach it with the maps. |
 
-Regions: all of Great Britain, England, Scotland, Wales, and England's 47
-counties (Geofabrik's boundaries). A county is typically 50 to 90 MB; all of
-Great Britain is 3.2 GB. The relief adds 5 to 30 MB a county (Lancashire 10,
-Cumbria 27), and an estimated 500 to 700 MB to all of Great Britain.
+Regions (Geofabrik's boundaries):
+
+- all of Great Britain, England, Scotland, Wales, and England's 47
+  counties. A county is typically 50 to 90 MB; all of Great Britain is
+  3.2 GB. The relief adds 5 to 30 MB a county (Lancashire 10, Cumbria 27),
+  and an estimated 500 to 700 MB to all of Great Britain.
+- Italy, in Geofabrik's five parts: North-West (1.4 GB), North-East (1.3),
+  Central (1.0) and Southern Italy (1.0), and Sicily and Sardinia (0.6).
+  Italy is a heading in the app, not a download: all of it would be over
+  GitHub's 2 GiB a file, and more than a phone wants.
+
+The Alps (by country, and all of Slovenia) and Norway (in its five
+landsdeler) are defined too, and were built once (October 2026: the
+Austrian Alps 1.6 GB, Northern Norway 1.8 GB, the rest 0.3 to 1.6), but are
+not built or published: `BUILT` in `pipeline/areas.py` leaves them out.
+Adding one there is all it takes to have it again.
 
 ## Updating the maps
 
@@ -38,16 +50,20 @@ That is the whole job. In order, it:
 2. checks whether OpenStreetMap has newer data than what is published, or
    the pipeline has changed since, and stops there if neither (`--force`
    rebuilds anyway);
-3. downloads the newest data and rebuilds every region (about two hours,
-   half an hour more the first time, for England's LIDAR);
-4. publishes them here as a new release (~12 GB: about an hour at 3 MB/s,
-   four on a slow line; four files go up at a time).
+3. downloads the newest data and rebuilds every region, an area at a time
+   (Great Britain, then Italy: about three hours, more the first time, for
+   England's LIDAR and the Copernicus DEM);
+4. publishes them here as a new release (~18 GB: under two hours at
+   3 MB/s, more on a slow line; four files go up at a time).
 
 Each step says what it is doing, how long it usually takes and how long the
 run has taken so far; downloads and uploads show their progress. Only one
 build or upload runs at a time in this folder: a second says so and stops,
 rather than overwriting the first one's files. Anything interrupted picks up
-where it left off when run again. Apps notice newer data the next time they
+where it left off when run again: a download, an upload, and a build, which
+keeps the areas it had finished (from the same data, by the same pipeline)
+and carries on with the data it had, not newer. An upload left unfinished
+by a pipeline that has changed since is dropped, not finished. Apps notice newer data the next time they
 check and offer each region's update; no app release is needed.
 
 Monthly is plenty. It needs, on the machine that runs it:
@@ -55,13 +71,18 @@ Monthly is plenty. It needs, on the machine that runs it:
 - Java 21 or newer, and [uv](https://docs.astral.sh/uv/) (Python packages
   install themselves into `data/.venv` the first time)
 - the GitHub CLI, `gh`, logged in once with `gh auth login`
-- ~55 GB of disk and ~24 GB of RAM
+- ~24 GB of RAM, and disk: ~100 GB free the first time, ~40 GB after (it
+  says so and stops before building if there is less)
 
 Everything it downloads and builds stays in `data/` (gitignored). The first
 run also fetches the Environment Agency's LIDAR for England (about half an
 hour; kept in `data/src/lidar`, so later runs fetch only squares that
-failed). The relief's 20 m height grid and what is worked out from it take
-about 10 GB of `data/work`.
+failed), and the Copernicus DEM for Italy (some 3 GB, kept in
+`data/src/copernicus`). Temporary files go in `data/tmp`, emptied each
+run, not `/tmp`, which may be memory. An area's files are in `data/work/<area>`: Great
+Britain's relief's 20 m height grid and what is worked out from it take
+about 10 GB, and the other areas' grids are files mostly holes, taking
+room only where there is land.
 `pipeline/serve.sh` serves `data/out` to a USB-attached phone, to try a
 build before publishing it.
 
@@ -99,32 +120,65 @@ build before publishing it.
 
 | | | Licence |
 | --- | --- | --- |
-| OpenStreetMap, Geofabrik's United Kingdom extract | roads, paths, rights of way, land, names | ODbL: credit "© OpenStreetMap contributors" |
+| OpenStreetMap, Geofabrik's United Kingdom and Italy extracts | roads, paths, rights of way, land, names | ODbL: credit "© OpenStreetMap contributors" |
 | OS Terrain 50, 50 m height grid for Great Britain | contours, and climb on the walking graph | OGL: credit "Contains OS data © Crown copyright and database right" |
+| The Copernicus DEM, GLO-30: 1 arc-second (about 30 m) heights, everywhere but Great Britain | contours, relief, peak scores and climb | Free to use with credit: "produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved" |
 | Natural Earth, OSM water polygons | low zooms and the sea, fetched by Planetiler | public domain / ODbL |
 
 Geofabrik's United Kingdom is England, Scotland and Wales; Northern Ireland
 is in its Ireland extract. So the regions are Great Britain, its three
 countries, and England's 47 counties.
 
+The Copernicus DEM is a surface model: in a wood its height is the trees'
+tops, near enough, not the ground. On open hills and mountains, what the
+relief and the peak scores are for, it is the ground; its contours are
+drawn every 20 m (an index every 100 m), as mountain maps draw them, from the heights a little smoothed, and the relief from them
+smoothed by a cell, without the speckle of steep ground its trees and
+roofs would draw.
+
+## Areas
+
+The pipeline builds an **area** at a time (`pipeline/areas.py`), start to
+end, each from its own extract and height grid, and cuts that area's
+regions from what it builds:
+
+| Area | Extract | Heights | Grid | |
+| --- | --- | --- | --- | --- |
+| `gb` | United Kingdom | OS Terrain 50; the Environment Agency's LIDAR in England | OSGB, 20 m (50 m for the graphs' climbs) | built |
+| `italy` | Italy | Copernicus DEM | transverse Mercator about 12.8°E, 25 m | built |
+| `alps` | Alps | Copernicus DEM | transverse Mercator about 10.8°E, 25 m | defined |
+| `slovenia` | Slovenia | Copernicus DEM | transverse Mercator about 15°E, 25 m | defined |
+| `norway` | Norway (Svalbard and Jan Mayen left out) | Copernicus DEM | transverse Mercator about 18°E, 30 m | defined |
+
+So the regions of an area join without a seam (their tiles are cut from
+the same file), and regions of two areas, where they overlap (the Italian
+Alps and North-East Italy, were the Alps built), are separate maps. Graph node ids are OpenStreetMap's,
+the same in every area, so the app routes across both. Each grid file has
+a `.grid.json` beside it saying where it lies (`pipeline/grid.py`).
+
 ## Steps
+
+The regions first, then each area's steps, from its heights to its tiles,
+then the overview and the catalogue.
 
 | Script | Makes |
 | --- | --- |
-| `pipeline/regions.py` | The 51 regions and their outlines from Geofabrik's index: in full for cutting, and simplified for the app (`app-regions.json`), which is how it tells which region you are in with no signal. |
-| `pipeline/terrain.py` | OS Terrain 50 as one 1.4 GB height grid (`dem.npy`), and 10 m contours, traced with contourpy and written as shapefiles in WGS84. |
-| `pipeline/lidar.py` | A 20 m height grid for the relief (`heights.npy`): the Environment Agency's LIDAR Composite DTM in England, fetched from its WCS at 10 m in 10 km squares (cached in `data/src/lidar`), OS Terrain 50 elsewhere, blended where they meet. |
-| `pipeline/relief.py` | The relief's raster tiles from it: hill shading (`shade.mbtiles`, zooms 8 to 12) and steep ground in bands from 25° (`slope.mbtiles`, zooms 8 to 14; the zooms below keep the steepest pixel, so it shows zoomed out). |
+| `pipeline/regions.py` | The regions of the areas built (57: 56 to download, and Italy as a heading), each with its area, and their outlines from Geofabrik's index: in full for cutting, and simplified for the app (`app-regions.json`), which is how it tells which region you are in with no signal. |
+| `pipeline/terrain.py` | Great Britain: OS Terrain 50 as one 1.4 GB height grid (`dem.npy`), and 10 m contours, traced with contourpy and written as shapefiles in WGS84. |
+| `pipeline/copernicus.py` | The other areas: the Copernicus DEM's tiles touching the area's regions, fetched once into `data/src/copernicus`, as the area's height grid (`heights.npy`, 25 or 30 m), and 20 m contours from it, as terrain.py draws them. |
+| `pipeline/lidar.py` | Great Britain: a 20 m height grid for the relief (`heights.npy`): the Environment Agency's LIDAR Composite DTM in England, fetched from its WCS at 10 m in 10 km squares (cached in `data/src/lidar`), OS Terrain 50 elsewhere, blended where they meet. Made again only when a square has come since. |
+| `pipeline/relief.py` | The relief's raster tiles from the height grid, round the area's regions: hill shading (`shade.mbtiles`, zooms 8 to 12) and steep ground in bands from 25° (`slope.mbtiles`, zooms 8 to 14; the zooms below keep the steepest pixel, so it shows zoomed out). Kept from the last run while the heights and the script are as they were. |
 | `pipeline/jut.py` | Each named peak's scores, how impressively it rises above the paths and roads, the sea and the lakes round it, and the place it rises most from (see below), for the hiking tiles' `jut` layer. |
 | `pipeline/parking.py` | How far each car park is from the nearest path a walk would use (see below), for the app to leave out the car parks in town. |
 | Planetiler, OpenMapTiles profile | The base map: land, water, roads, places, peaks, to z14. |
 | `pipeline/hiking/Hiking.java` | A Planetiler profile of our own for what OpenMapTiles leaves out: every path with its UK right of way (`row`), SAC difficulty, faint or private access; waymarked routes from route relations; the contours; every named peak; and every car park the public may use, from zoom 10, with its spaces (mapped, or worked out from its area: see below), fee, and whether it is for customers only; and the peak scores `jut.py` works out. |
 | `pipeline/tiles.py merge` | Both tile sets in one file. A vector tile's layers are a repeated protobuf field, so two tiles' bytes, concatenated, are one tile with both sets of layers. |
-| `pipeline/tiles.py cut` | Each region's tiles, z8 and up, within ~2 km of its outline, and the z0-7 overview the app ships (`overview.mbtiles`, 1.5 MB). Tiles are deduplicated: the sea is stored once. |
-| `pipeline/graph.py build` | The walking graph for all of Great Britain: walkable ways split at junctions, each edge costed both ways. |
-| `pipeline/graph.py build-driving` | The driving graph for all of Great Britain: roads cars may use, and car ferries, costed by speed each way. |
+| `pipeline/tiles.py cut` | Each of the area's regions' tiles, z8 and up, within ~2 km of its outline, and the area's z0-7. Tiles are deduplicated: the sea is stored once. Outside Great Britain, Planetiler makes tiles only round the regions (`areas.py poly`), not for all the sea and the countries round them. |
+| `pipeline/tiles.py overview` | The z0-7 overview the app ships (`overview.mbtiles`), from every area's: where two areas have the same tile, both in one, each layer's features from both and those alike (Natural Earth's) once. |
+| `pipeline/graph.py build` | The walking graph for all of an area: walkable ways split at junctions, each edge costed both ways. |
+| `pipeline/graph.py build-driving` | The driving graph for all of an area: roads cars may use, and car ferries, costed by speed each way. |
 | `pipeline/graph.py cut` | Each region's graph, in the app's binary format (documented in the app's `routing/Graph.kt`). Networks of under 50 edges, mapped without joining anything, are dropped: snapping to one would strand a route. |
-| `pipeline/catalog.py` | `catalog.json`: each region's files, sizes and SHA-256, and the version (the OSM data's date and the pipeline's revision). |
+| `pipeline/catalog.py` | `catalog.json`: each region's files, sizes and SHA-256, the version (Great Britain's OSM data's date and the pipeline's revision), and the two files the app ships (`assets`). Files in `data/out` of regions no longer built are removed: what is there is what is published. |
 
 ### Car parks
 
@@ -176,16 +230,23 @@ angle Q looks up at it, at the Q that makes it most. Adjusted:
 - Steepness counts for more: score = jut × (1 + 1.1 / (1 + e^(-0.45
   (steepness - 30°)))), ×1 on gentle ground, ×1.55 at 30°, to ×2.1.
 
-P is the summit (the highest 20 m cell within 40 m of the peak as
-mapped), on the relief's 20 m heights. Each score is ranked too: the
-highest within 5 km, and the highest in its county (England's counties
-as the regions have them; Scotland's council areas and Wales's principal
-areas) when nothing within 15 km, over the border either, is higher,
-which the app draws bigger, and those within a tenth of the
-highest within 5 km, a little bigger. The scores are in the tiles from
-zoom 8, each with its peak's name, height, county and country, which is
-what the app's list of them reads. `data/work/jut/jut.tsv` lists every
-score with what went into it.
+P is the summit (the highest cell within 40 m of the peak as mapped), on
+the relief's heights (20 m in Great Britain, 25 or 30 m elsewhere). Each
+score is ranked too: the highest within 5 km, and the highest in its
+county when nothing within 15 km, over the border either, is higher,
+which the app draws bigger, and those within a tenth of the highest
+within 5 km, a little bigger. A county is one of England's as the
+regions have them, Scotland's council areas and Wales's principal areas;
+elsewhere, OpenStreetMap's boundaries at the level a country's counties
+are: Italy's provinces, Norway's fylker, Switzerland's cantons, Austria's
+states, France's départements and Germany's Landkreise. Slovenia,
+Liechtenstein and Monaco, with none mapped between the country and its
+municipalities, are each a county of their own. A peak's country is its
+county's, or outside every county, the one it is in by Geofabrik's
+outline. The scores are in the tiles from zoom 8, each with its peak's
+name, height, county and country, which is what the app's list of them
+reads. `data/work/<area>/jut/jut.tsv` lists every score with what went
+into it.
 
 ### The walking graph
 
@@ -224,7 +285,11 @@ is how the app turns a cost into a driving time.
 | Car ferry (`motorcar` or `motor_vehicle=yes`) | 20 |
 
 A speed limit lowers a road's speed to 90% of the limit when that is lower
-(`30 mph`, `GB:nsl_single` and the like). One-way roads, roundabouts and
+(`30 mph`, `GB:nsl_single` and the like; abroad, a country's limits by
+kind of road where they are mapped in place of a number, `IT:rural` and
+the like: 50 in towns). No road is faster than 110: an Italian motorway's
+130 still counts as 110, so a drive there takes a little less than it
+says. One-way roads, roundabouts and
 motorways cost infinity the wrong way. Private roads, driveways and roads
 closed to cars are left out. Turn restrictions are not modelled.
 
@@ -251,6 +316,10 @@ the names its edges use.
 | Scotland | | | 644 MB |
 | Wales | | | 252 MB |
 | A county | 4 to 80 MB | 1.5 to 76 MB | 6 to 156 MB (Cumbria 75 MB) |
+
+Italy's parts are 0.6 to 1.4 GB (October 2026 data): about 45% tiles,
+30% graphs, the rest relief, steep ground mostly.
+
 ## Licences and credits
 
 - Map data © [OpenStreetMap](https://www.openstreetmap.org/copyright)
@@ -262,5 +331,10 @@ the names its edges use.
   [Open Government Licence](https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/)).
 - Contains Environment Agency LIDAR data © Environment Agency copyright
   and/or database right (LIDAR Composite DTM, Open Government Licence).
+- Heights in Italy produced using Copernicus WorldDEM-30
+  © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018
+  provided under COPERNICUS by the European Union and ESA; all rights
+  reserved ([the Copernicus DEM](https://spacedata.copernicus.eu/collections/copernicus-digital-elevation-model),
+  GLO-30, from its [open copy on AWS](https://registry.opendata.aws/copernicus-dem/)).
 - Tiles follow the [OpenMapTiles](https://openmaptiles.org/schema/) schema
   (CC BY 4.0), built with [Planetiler](https://github.com/onthegomap/planetiler).

@@ -4,7 +4,7 @@ How far each car park is from the nearest path a walk would use, for the
 app to show only those a walk might start from: not the supermarket's, the
 station's or the multi-storey in town.
 
-    parking.py <osm.pbf> <out.tsv>
+    parking.py <area> <osm.pbf> <out.tsv>
 
 A path a walk would use is a path, footway, bridleway, track, steps or
 cycleway that walkers may use (as the walking graph has it, graph.py),
@@ -17,7 +17,7 @@ a common or open country, or along a canal (its towpath). A paved path
 between houses is not one.
 
 Where each piece of a path is, is read off a 50 m grid of what the land
-is: built-up, green (which wins over built-up: a park among houses is a
+is, over the area's height grid's ground (pipeline/areas.py): built-up, green (which wins over built-up: a park among houses is a
 park), and within 75 m of a canal (which wins over both). Paths are read
 every 25 m, so a distance is good to that.
 
@@ -35,10 +35,10 @@ import numpy as np
 import pyproj
 
 sys.path.insert(0, os.path.dirname(__file__))
+from areas import AREAS  # noqa: E402
 from graph import factor  # noqa: E402
 
 CELL = 50
-COLS, ROWS = 700_000 // CELL, 1_300_000 // CELL
 EVERY = 25  # metres between the points a path is read at
 MOST = 5000
 TOWN, GREEN, CANAL = 1, 2, 3
@@ -136,15 +136,15 @@ def read(pbf):
     return paths, canals, areas, parks
 
 
-def grid_of(areas, canals, to_osgb):
-    """The land, as TOWN, GREEN or CANAL, in 50 m cells, row 0 the southmost, as the other grids are at 20 m."""
+def grid_of(areas, canals, to_local, rows, cols):
+    """The land, as TOWN, GREEN or CANAL, in 50 m cells, row 0 the southmost, as the height grid is in its."""
     from PIL import Image, ImageDraw
     Image.MAX_IMAGE_PIXELS = None
-    image = Image.new("L", (COLS, ROWS), 0)
+    image = Image.new("L", (cols, rows), 0)
     draw = ImageDraw.Draw(image)
 
     def cells(xy):
-        e, n = to_osgb(xy[:, 0], xy[:, 1])
+        e, n = to_local(xy[:, 0], xy[:, 1])
         return list(zip(e / CELL, n / CELL))
 
     # Built-up first, then green over it, then the canals over both.
@@ -161,19 +161,20 @@ def grid_of(areas, canals, to_osgb):
     return np.asarray(image)
 
 
-def walk_points(paths, grid, to_osgb):
-    """Every path a walk would use, read every EVERY metres, as OSGB eastings and northings."""
+def walk_points(paths, grid, to_local):
+    """Every path a walk would use, read every EVERY metres, as metres east and north on the grid."""
+    rows, cols = grid.shape
     out = []
     for xy, away in paths:
-        e, n = to_osgb(xy[:, 0], xy[:, 1])
+        e, n = to_local(xy[:, 0], xy[:, 1])
         de, dn = np.diff(e), np.diff(n)
         steps = np.ceil(np.hypot(de, dn) / EVERY).astype(np.int64) + 1
         seg = np.repeat(np.arange(len(de)), steps)
         f = (np.arange(steps.sum()) - np.repeat(np.cumsum(steps) - steps, steps)) / np.repeat(np.maximum(steps - 1, 1), steps)
         pe, pn = e[seg] + f * de[seg], n[seg] + f * dn[seg]
         if not away:
-            r = np.clip((pn // CELL).astype(np.int64), 0, ROWS - 1)
-            c = np.clip((pe // CELL).astype(np.int64), 0, COLS - 1)
+            r = np.clip((pn // CELL).astype(np.int64), 0, rows - 1)
+            c = np.clip((pe // CELL).astype(np.int64), 0, cols - 1)
             keep = grid[r, c] != TOWN
             pe, pn = pe[keep], pn[keep]
         if len(pe):
@@ -183,18 +184,23 @@ def walk_points(paths, grid, to_osgb):
 
 def main():
     from scipy.spatial import cKDTree
-    pbf, out = sys.argv[1:3]
+    area, pbf, out = sys.argv[1:4]
     t = time.time()
-    to_osgb = pyproj.Transformer.from_crs(4326, 27700, always_xy=True).transform
+    g = AREAS[area].grid(CELL)
+    to_grid = pyproj.Transformer.from_crs("EPSG:4326", g.crs, always_xy=True).transform
+
+    def to_local(lon, lat):
+        x, y = to_grid(lon, lat)
+        return np.asarray(x) - g.x0, np.asarray(y) - g.y0
     paths, canals, areas, parks = read(pbf)
     print(f"    {len(paths)} paths, {len(canals)} canals, {len(areas)} built-up and green areas, {len(parks)} car parks"
           f" read in {time.time() - t:.0f}s", flush=True)
-    grid = grid_of(areas, canals, to_osgb)
+    grid = grid_of(areas, canals, to_local, g.rows, g.cols)
     del areas, canals
-    points = walk_points(paths, grid, to_osgb)
+    points = walk_points(paths, grid, to_local)
     del grid, paths
     print(f"    {len(points) / 1e6:.0f}M points along paths a walk would use, in {time.time() - t:.0f}s", flush=True)
-    e, n = to_osgb(np.array([p[1] for p in parks]), np.array([p[2] for p in parks]))
+    e, n = to_local(np.array([p[1] for p in parks]), np.array([p[2] for p in parks]))
     d, _ = cKDTree(points).query(np.column_stack([e, n]), distance_upper_bound=MOST)
     metres = np.minimum(np.round(np.nan_to_num(d, posinf=MOST) / 10) * 10, MOST).astype(int)
     with open(out + ".part", "w") as f:

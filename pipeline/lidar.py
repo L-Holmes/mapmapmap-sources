@@ -19,7 +19,8 @@ squares fetched are those touching the regions named (England if none).
 LIDAR's 10 m cells in it, where it has any, Terrain 50 bilinearly where not;
 and for 200 m either side of where one gives way to the other, a blend of
 the two, so that neither England's border nor a gap in the LIDAR shows as
-a step (which the relief would draw as a cliff).
+a step (which the relief would draw as a cliff). It is made again only
+when a square has come since it was made, or Terrain 50 is newer.
 
 Why it is worth it: at 50 m, Terrain 50 evens out the crags and gullies a
 walker meets, and steep ground comes out as broad blurs; at 20 m the LIDAR
@@ -265,6 +266,12 @@ def main():
     regions_path, dem_path, cache, out_path = sys.argv[1:5]
     ids = sys.argv[5:] or ["england"]
     fetch_all(cache, squares(regions_path, ids), np.load(dem_path, mmap_mode="r"))
+    # The grid is made from the squares and Terrain 50 alone: with nothing
+    # new of either since it was made (a square coming changes the cache
+    # folder's time), the one made last time is it.
+    if os.path.exists(out_path) and os.path.getmtime(out_path) > max(os.path.getmtime(dem_path), os.path.getmtime(cache)):
+        print("    no new LIDAR squares: the height grid is as it was")
+        return
     build(dem_path, cache, out_path)
 
 
