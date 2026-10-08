@@ -22,11 +22,14 @@ lock() {
 }
 
 # The pipeline's revision: the parts of it that shape the files built,
-# hashed. It is in the published version, after the map data's date, so a
-# change to the pipeline is a new version: update-maps.sh rebuilds for it
-# even when OpenStreetMap has nothing newer, and apps offer it as an update.
+# hashed, with the reference heat tiles the walked layer is read from
+# (data/src/walked, pipeline/walked.py). It is in the published version,
+# after the map data's date, so a change to the pipeline, or a reference
+# added, is a new version: update-maps.sh rebuilds for it even when
+# OpenStreetMap has nothing newer, and apps offer it as an update.
 revision() {
-  cat $(ls pipeline/build.sh pipeline/*.py pipeline/hiking/*.java | sort) | sha256sum | cut -c1-7
+  cat $(ls pipeline/build.sh pipeline/*.py pipeline/hiking/*.java | sort) \
+    $(find data/src/walked -name '*.png' 2>/dev/null | sort) | sha256sum | cut -c1-7
 }
 
 elapsed() {

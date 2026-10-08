@@ -65,8 +65,13 @@ import java.util.regex.Pattern;
  *                 and scores first; and from zoom 12 a line from the summit
  *                 to its base, the place it rises most from, and a point
  *                 there, with "kind" and "peak_score", the summit's score.
+ *   walked        how much ways are walked, as lines, where there is a
+ *                 reference heat tile (pipeline/walked.py), from zoom 10:
+ *                 "heat" 1 to 255 (half-octave steps); "mapped" 1 along
+ *                 a way the map has, absent where people walk and the map
+ *                 has no way; "road" 1 along a way cars use.
  *
- *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --jut=<dir> --parking=<tsv> --output=...
+ *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --jut=<dir> --parking=<tsv> --walked=<dir> --output=...
  */
 public class Hiking implements Profile {
 
@@ -136,6 +141,15 @@ public class Hiking implements Profile {
           .setMinZoom(12)
           .setMinPixelSize(0);
       }
+      return;
+    }
+    if ("walked".equals(sf.getSource())) {
+      features.line("walked")
+        .setAttr("heat", sf.getLong("heat"))
+        .setAttr("mapped", sf.getLong("mapped") == 1 ? 1 : null)
+        .setAttr("road", sf.getLong("road") == 1 ? 1 : null)
+        .setMinZoom(10)
+        .setMinPixelSize(0);
       return;
     }
     if (sf.hasTag("amenity", "parking")) {
@@ -373,6 +387,11 @@ public class Hiking implements Profile {
     if (layer.equals("feature") || layer.equals("peak") || layer.equals("parking") || layer.equals("jut")) {
       return items;
     }
+    if (layer.equals("walked")) {
+      // Joined the same, but none dropped for being short: a way's heat changes along it, and a
+      // short stretch of one heat left out would be a gap in the line.
+      return FeatureMerge.mergeLineStrings(items, 0, 0.25, 4);
+    }
     // Join the pieces of each line that share their attributes, so dashes
     // and labels run on across way boundaries.
     return FeatureMerge.mergeLineStrings(items, 0.5, 0.25, 4);
@@ -392,12 +411,14 @@ public class Hiking implements Profile {
     Arguments arguments = Arguments.fromArgsOrConfigFile(args);
     Path contours = arguments.file("contours", "contour shapefile directory", Path.of("contours"));
     Path jut = arguments.file("jut", "peak score shapefile directory (pipeline/jut.py)", Path.of("jut"));
+    Path walked = arguments.file("walked", "how much ways are walked, shapefile directory (pipeline/walked.py)", Path.of("walked"));
     PATH_M = pathM(arguments.file("parking", "car parks' metres to a walk's path (pipeline/parking.py)", Path.of("parking.tsv")));
     Planetiler.create(arguments)
       .setProfile(new Hiking())
       .addOsmSource("osm", arguments.inputFile("osm_path", "OSM input file", Path.of("input.osm.pbf")))
       .addShapefileGlobSource("EPSG:4326", "contours", contours, "*.shp", null)
       .addShapefileGlobSource("EPSG:4326", "jut", jut, "*.shp", null)
+      .addShapefileGlobSource("EPSG:4326", "walked", walked, "*.shp", null)
       .overwriteOutput(arguments.file("output", "output file", Path.of("hiking.mbtiles")))
       .run();
   }

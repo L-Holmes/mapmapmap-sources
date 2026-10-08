@@ -48,12 +48,12 @@ if [[ ! -x "$PY" ]]; then
   uv venv -q data/.venv
 fi
 # Every run, so a venv from before a package was needed gets it (quick when it has them all).
-VIRTUAL_ENV=data/.venv uv pip install -q numpy scipy shapely osmium contourpy pyproj pyshp pillow tifffile imagecodecs
+VIRTUAL_ENV=data/.venv uv pip install -q numpy scipy shapely osmium contourpy pyproj pyshp pillow tifffile imagecodecs scikit-image
 PLANETILER_VERSION=v0.10.2
 [[ -f "$SRC/planetiler.jar" ]] || curl -fL --progress-bar -o "$SRC/planetiler.jar" \
   "https://github.com/onthegomap/planetiler/releases/download/$PLANETILER_VERSION/planetiler.jar"
 AREAS=$($PY pipeline/areas.py ids)
-STEPS=$((3 + 9 * $(wc -w <<<"$AREAS") + 2))
+STEPS=$((3 + 10 * $(wc -w <<<"$AREAS") + 2))
 
 # Great Britain's files, from before there were other areas, where its are now.
 if [[ -d "$WORK/terrain" && ! -d "$WORK/gb" ]]; then
@@ -190,7 +190,7 @@ build_area() {
   local stamp
   stamp="$(revision) $(cat "$SRC/$STEM.name")"
   if [[ "$(cat "$W/built" 2>/dev/null)" == "$stamp" && -f "$W/overview.mbtiles" ]]; then
-    N=$((N + 9))
+    N=$((N + 10))
     printf '\n==> [%s/%s] %s: built already, from %s by this pipeline (in a run that stopped later on): kept\n' \
       "$N" "$STEPS" "${AREA_NAME^}" "$(cat "$SRC/$STEM.name")"
     return
@@ -243,6 +243,9 @@ build_area() {
   mkdir -p "$W/parking"
   $PY -u pipeline/parking.py "$area" "$PBF" "$W/parking/near.tsv"
 
+  next "how much the ways are walked, where there are reference heat tiles ($SRC/walked)" "seconds"
+  $PY -u pipeline/walked.py "$area" "$BOUNDS" "$W/graph.npz" "$W/driving.npz" "$SRC/walked" "$W/walked"
+
   # Outside Great Britain, tiles only round the regions: the extract's
   # bounds hold a lot of sea and other countries, all empty tiles.
   local polygon=()
@@ -258,10 +261,11 @@ build_area() {
     --output="$W/omt.mbtiles" --download --download-dir="$SRC/sources" --tmpdir="$WORK/tmp" --force \
     --languages=en --exclude-layers=housenumber --maxzoom=14 --bounds="$BOUNDS" "${polygon[@]}"
 
-  next "hiking tiles: paths, rights of way, routes, contours, car parks, peak scores" "$(usually 3)"
+  next "hiking tiles: paths, rights of way, routes, contours, car parks, peak scores, how walked" "$(usually 3)"
   echo "    Planetiler's own log follows; its \"data errors:\" list at the end is usually empty: expected."
   java -Xmx12g -cp "$SRC/planetiler.jar" pipeline/hiking/Hiking.java --osm-path="$PBF" \
-    --contours="$W/terrain/contours" --jut="$W/jut" --parking="$W/parking/near.tsv" --output="$W/hiking.mbtiles" \
+    --contours="$W/terrain/contours" --jut="$W/jut" --parking="$W/parking/near.tsv" --walked="$W/walked" \
+    --output="$W/hiking.mbtiles" \
     --tmpdir="$WORK/tmp" --force --maxzoom=14 --bounds="$BOUNDS" "${polygon[@]}"
 
   next "merge and cut tiles by region" "$(usually 2)"

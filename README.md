@@ -170,8 +170,9 @@ then the overview and the catalogue.
 | `pipeline/relief.py` | The relief's raster tiles from the height grid, round the area's regions: hill shading (`shade.mbtiles`, zooms 8 to 12) and steep ground in bands from 25° (`slope.mbtiles`, zooms 8 to 14; the zooms below keep the steepest pixel, so it shows zoomed out). Kept from the last run while the heights and the script are as they were. |
 | `pipeline/jut.py` | Each named peak's scores, how impressively it rises above the paths and roads, the sea and the lakes round it, and the place it rises most from (see below), for the hiking tiles' `jut` layer. |
 | `pipeline/parking.py` | How far each car park is from the nearest path a walk would use (see below), for the app to leave out the car parks in town. |
+| `pipeline/walked.py` | How much each way is walked, as lines, where there is a reference heat tile in `data/src/walked` (see below), for the hiking tiles' `walked` layer. |
 | Planetiler, OpenMapTiles profile | The base map: land, water, roads, places, peaks, to z14. |
-| `pipeline/hiking/Hiking.java` | A Planetiler profile of our own for what OpenMapTiles leaves out: every path with its UK right of way (`row`), SAC difficulty, faint or private access; waymarked routes from route relations; the contours; every named peak; and every car park the public may use, from zoom 10, with its spaces (mapped, or worked out from its area: see below), fee, and whether it is for customers only; and the peak scores `jut.py` works out. |
+| `pipeline/hiking/Hiking.java` | A Planetiler profile of our own for what OpenMapTiles leaves out: every path with its UK right of way (`row`), SAC difficulty, faint or private access; waymarked routes from route relations; the contours; every named peak; and every car park the public may use, from zoom 10, with its spaces (mapped, or worked out from its area: see below), fee, and whether it is for customers only; the peak scores `jut.py` works out; and how walked the ways are, from `walked.py`. |
 | `pipeline/tiles.py merge` | Both tile sets in one file. A vector tile's layers are a repeated protobuf field, so two tiles' bytes, concatenated, are one tile with both sets of layers. |
 | `pipeline/tiles.py cut` | Each of the area's regions' tiles, z8 and up, within ~2 km of its outline, and the area's z0-7. Tiles are deduplicated: the sea is stored once. Outside Great Britain, Planetiler makes tiles only round the regions (`areas.py poly`), not for all the sea and the countries round them. |
 | `pipeline/tiles.py overview` | The z0-7 overview the app ships (`overview.mbtiles`), from every area's: where two areas have the same tile, both in one, each layer's features from both and those alike (Natural Earth's) once. |
@@ -247,6 +248,30 @@ outline. The scores are in the tiles from zoom 8, each with its peak's
 name, height, county and country, which is what the app's list of them
 reads. `data/work/<area>/jut/jut.tsv` lists every score with what went
 into it.
+
+### How walked
+
+The `walked` layer is read from reference heat tiles: Strava heatmap
+tiles, one at a time, fetched with mapmapmap's `PYTHON/get-single-tile.py`
+and put in `data/src/walked` under the name it gives them (which says which
+tile each is). A tile's palette index is its heat. `walked.py` finds the
+core of each line of heat (where it is at least half the heat round it),
+read at ~2 m, and gives each bit of it within 1.5 reference pixels (34 m
+at zoom 11) to the nearest way of the walking graph; heat within 11 m of a
+way is its own too, the core of a line or not (in a town the streets are
+closer than the reference tells apart). Along each way the heat is made to
+run on: gaps of up to 50 m filled, the heat a median over 51 m, run on to
+a junction from 60 m, and ways of up to 120 m between walked ones walked
+too. On the Pendle tile, every way under heat of 100 or more gets a line,
+and 3% of the line drawn is over no heat at all.
+Where people walk and the map has no way (heat 2 or more), the core is
+thinned to lines, joined on to the ways they end near; scraps on their own
+and lines that only shadow a way are left out. Each line has its heat in
+half-octave steps, `mapped` 1 along a way, and `road` 1 along a way cars
+use (one of the driving graph's: not a track, path, footway or
+driveway). The tiles carry them from zoom 10. The references are hashed into the pipeline's
+revision (`common.sh`), so adding one is a new version, which
+`update-maps.sh` builds and publishes.
 
 ### The walking graph
 
