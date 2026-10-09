@@ -69,7 +69,10 @@ import java.util.regex.Pattern;
  *                 reference heat tile (pipeline/walked.py), from zoom 10:
  *                 "heat" 1 to 255 (half-octave steps); "mapped" 1 along
  *                 a way the map has, absent where people walk and the map
- *                 has no way; "road" 1 along a way cars use.
+ *                 has no way; "road" 1 along a way cars use; "park_m", the
+ *                 metres on foot from the car park a walker would start
+ *                 from, and "loop_m", the shortest round walk from it that
+ *                 takes the line in (each to the next 100, where there is one).
  *
  *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --jut=<dir> --parking=<tsv> --walked=<dir> --output=...
  */
@@ -148,6 +151,8 @@ public class Hiking implements Profile {
         .setAttr("heat", sf.getLong("heat"))
         .setAttr("mapped", sf.getLong("mapped") == 1 ? 1 : null)
         .setAttr("road", sf.getLong("road") == 1 ? 1 : null)
+        .setAttr("park_m", sf.getLong("park_m") > 0 ? sf.getLong("park_m") : null)
+        .setAttr("loop_m", sf.getLong("loop_m") > 0 ? sf.getLong("loop_m") : null)
         .setMinZoom(10)
         .setMinPixelSize(0);
       return;

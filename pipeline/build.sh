@@ -241,10 +241,10 @@ build_area() {
 
   next "car parks: how far each is from a path a walk would use" "$(usually 10)"
   mkdir -p "$W/parking"
-  $PY -u pipeline/parking.py "$area" "$PBF" "$W/parking/near.tsv"
+  $PY -u pipeline/parking.py "$area" "$PBF" "$W/parking/near.tsv" "$W/parking/parks.tsv"
 
   next "how much the ways are walked, where there are reference heat tiles ($SRC/walked)" "seconds"
-  $PY -u pipeline/walked.py "$area" "$BOUNDS" "$W/graph.npz" "$W/driving.npz" "$SRC/walked" "$W/walked"
+  $PY -u pipeline/walked.py "$area" "$BOUNDS" "$W/graph.npz" "$W/driving.npz" "$W/parking/parks.tsv" "$SRC/walked" "$W/walked"
 
   # Outside Great Britain, tiles only round the regions: the extract's
   # bounds hold a lot of sea and other countries, all empty tiles.

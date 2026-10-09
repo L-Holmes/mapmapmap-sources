@@ -269,7 +269,16 @@ thinned to lines, joined on to the ways they end near; scraps on their own
 and lines that only shadow a way are left out. Each line has its heat in
 half-octave steps, `mapped` 1 along a way, and `road` 1 along a way cars
 use (one of the driving graph's: not a track, path, footway or
-driveway). The tiles carry them from zoom 10. The references are hashed into the pipeline's
+driveway). The tiles carry them from zoom 10.
+
+Each walked line also says how far it is on foot from the car park a
+walker would start from (`park_m`), and the shortest round walk from that
+car park that takes it in (`loop_m`), up to 5 km. The car parks are those
+the app shows, as `parking.py` lists them (`parks.tsv`); a line's is the
+one the least far along the ways, times a little more the fewer spaces it
+has, so a bigger one nearer always wins. A round walk follows walked ways
+(and any way within 300 m of the car park, to reach them), and at most 40%
+of it is walked twice. The app filters the off-road lines by them. The references are hashed into the pipeline's
 revision (`common.sh`), so adding one is a new version, which
 `update-maps.sh` builds and publishes.
 

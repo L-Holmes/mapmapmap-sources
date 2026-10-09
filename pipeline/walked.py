@@ -3,7 +3,7 @@
 How much each way is walked, read from reference heat tiles, as lines for
 the hiking tiles' "walked" layer.
 
-    walked.py <area> <bounds> <graph.npz> <driving.npz> <references dir> <out dir>
+    walked.py <area> <bounds> <graph.npz> <driving.npz> <parks.tsv> <references dir> <out dir>
 
 A reference is one heatmap tile (Strava's: mapmapmap's
 PYTHON/get-single-tile.py fetches one), kept in <references dir>
@@ -48,12 +48,30 @@ A way is a road where cars use it: where it is one of the driving graph's
 (graph.py build-driving: not a track, path, footway or driveway, nor a
 way cars may not use).
 
+And from the car parks (<parks.tsv>, pipeline/parking.py: those a walk
+might start from, and of them those the app shows, within WALK_M of a path
+a walk would use): each walked way's car park is the one a walker would
+start from, as near as can be told: the one the least far along the ways
+(within PARK_REACH, any way walkers may use, from the way it is nearest),
+times a little more the fewer spaces it has (size_penalty()); so one with a
+bigger one nearer is never it, and a lay-by a little nearer does not win
+over a car park of fifty. And a round walk from it: a walk from the car
+park and back, along walked ways (and any way within ACCESS of the car
+park, to get on to them), that takes in the way, of up to LOOP_MOST, with at
+most REPEAT of it walked twice (out and back the same way, from the car
+park). Round walks are read off the shortest ways from the car park: each
+walked way not on them closes one.
+
 <out dir>/walked.shp (with .dbf, .shx, .prj), lines, each with:
   heat    how walked, 1 to 255 in half-octave steps (1, 1.4, 2, 2.8, 4,
           ... 181, 255, rounded), the reference's heat
   mapped  1 along a way of the walking graph, following it; 0 where the
           reference has a line and the map has no way, as the heat runs
   road    1 along a way cars use
+  park_m  metres on foot from its car park, to the next 100 up; 0 for none
+          within PARK_REACH (a line off the ways: from the way it joins)
+  loop_m  the shortest round walk from its car park that takes it in, to
+          the next 100 up; 0 for none (and for every line off the ways)
 pipeline/hiking/Hiking.java puts them in its "walked" layer.
 """
 import glob
@@ -88,6 +106,13 @@ OFF_HEAT = 2.0  # the least heat a line off the ways is made from
 ROUND = 14.0  # metres: a line off the ways is the running mean of its points over this
 BESIDE = 55.0  # metres: a line off the ways within this of one for most of its length is that way's heat
 ROAD_NEAR = 3.0  # metres: a walking way this near a driving one, for most of its length, is a road
+PARK_REACH = 5000.0  # metres: the furthest along the ways a car park is looked for (the most the app asks for)
+LOOP_MOST = 5000.0  # metres: the longest round walk looked for
+REPEAT = 0.4  # the most of a round walk walked twice
+ACCESS = 300.0  # metres along any way from a car park to the walked ones, for a round walk
+PARK_SNAP = 250.0  # metres: a car park further than this from every way is not one a walk starts from
+WALK_M = 500  # metres: car parks further than this from a path a walk would use are not on the map (tools/styles.py)
+WALKED_SHARE = 0.6  # a way walked for this much of it or more is walked, for round walks
 EARTH = 40075016.686  # metres round the equator
 NAME = re.compile(r"_z(\d+)_x(\d+)_y(\d+)_lat[-\d.]+_lon[-\d.]+\.png$")
 NEIGHBOURS = ((0, 1), (1, 0), (1, 1), (1, -1))
@@ -122,13 +147,131 @@ def level(heat):
     return np.minimum(q, 255).astype(np.int32)
 
 
-def ways_near(graph, west, south, east, north):
-    """The graph's ways reaching into the box: each its ends (node numbers), longitudes and latitudes."""
-    lat, lon, starts = graph["lat"], graph["lon"], graph["geom"]
+def edges_near(graph, west, south, east, north):
+    """The graph's ways (edge numbers) reaching into the box."""
+    lat, lon = graph["lat"], graph["lon"]
     inside = np.flatnonzero((lon >= west * 1e7) & (lon <= east * 1e7) & (lat >= south * 1e7) & (lat <= north * 1e7))
-    edges = np.unique(np.searchsorted(starts, inside, side="right") - 1)
-    return [(int(graph["u"][e]), int(graph["v"][e]), lon[starts[e]:starts[e + 1]] / 1e7, lat[starts[e]:starts[e + 1]] / 1e7)
-            for e in edges]
+    return np.unique(np.searchsorted(graph["geom"], inside, side="right") - 1)
+
+
+def ways_near(graph, west, south, east, north):
+    """The graph's ways reaching into the box: each its edge number, ends (node numbers), longitudes and latitudes."""
+    lat, lon, starts = graph["lat"], graph["lon"], graph["geom"]
+    return [(int(e), int(graph["u"][e]), int(graph["v"][e]), lon[starts[e]:starts[e + 1]] / 1e7, lat[starts[e]:starts[e + 1]] / 1e7)
+            for e in edges_near(graph, west, south, east, north)]
+
+
+def size_penalty(spaces):
+    """How much further a car park seems for its size: a lay-by of 4 half as far again, a car park of 100 a tenth."""
+    return 1 + 1.5 / math.sqrt(spaces if spaces else 10)
+
+
+def read_parks(path):
+    """The car parks on the map a walk might start from: (lon, lat, spaces) each, spaces 0 for not known."""
+    out = []
+    with open(path) as f:
+        for row in f:
+            key, lon, lat, spaces, path_m = row.rstrip("\n").split("\t")
+            if int(path_m) <= WALK_M:
+                out.append((float(lon), float(lat), int(spaces) if spaces else 0))
+    return out
+
+
+def from_car_parks(walking, parks, box, ways, walked):
+    """
+    For each of [ways] (the tile's, as ways_near() gives them, each with the
+    share of it [walked]): its car park's metres, and the shortest round walk
+    from that car park taking it in, both by way index, for those that have
+    them. See the module's notes.
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
+    west, south, east, north = box
+    k = math.cos(math.radians((north + south) / 2))
+    pad_lat, pad_lon = PARK_REACH / 110_574, PARK_REACH / (111_320 * k)
+    big = edges_near(walking, west - pad_lon, south - pad_lat, east + pad_lon, north + pad_lat)
+    nodes, local = np.unique(np.r_[walking["u"][big], walking["v"][big]], return_inverse=True)
+    a, b, length = local[:len(big)], local[len(big):], np.maximum(walking["length"][big].astype(float), 0.01)
+
+    def graph(edges):
+        """The ways [edges] (indices into big) as a graph of their nodes, the shortest of any two between the same ends;
+        and which edge joins any two nodes."""
+        order = edges[np.argsort(length[edges], kind="stable")]
+        pair = {}
+        for i in order:
+            if a[i] != b[i]:
+                pair.setdefault((min(a[i], b[i]), max(a[i], b[i])), i)
+        keep = np.array(list(pair.values()), dtype=int)
+        m = csr_matrix((np.r_[length[keep], length[keep]], (np.r_[a[keep], b[keep]], np.r_[b[keep], a[keep]])),
+                       shape=(len(nodes), len(nodes)))
+        return m, pair
+
+    # The car parks, each on the way's end nearest it.
+    x = lambda lon, lat: np.column_stack([np.asarray(lon) * 111_320 * k, np.asarray(lat) * 110_574])
+    near = cKDTree(x(walking["node_lon"][nodes] / 1e7, walking["node_lat"][nodes] / 1e7))
+    inside = [p for p in parks if west - pad_lon <= p[0] <= east + pad_lon and south - pad_lat <= p[1] <= north + pad_lat]
+    park_node, park_access, penalty = [], [], []
+    for lon, lat, spaces in inside:
+        d, j = near.query(x(lon, lat)[0])
+        if d <= PARK_SNAP:
+            park_node.append(j)
+            park_access.append(d)
+            penalty.append(size_penalty(spaces))
+    park_m, loop_m = {}, {}
+    if not park_node:
+        return park_m, loop_m
+    access, penalty = np.array(park_access), np.array(penalty)
+    everything, _ = graph(np.arange(len(big)))
+    far = dijkstra(everything, indices=park_node, limit=PARK_REACH)
+
+    # Each way's car park: the least far, for its size.
+    where = {e: i for i, e in enumerate(big)}
+    index = [where[w[0]] for w in ways]
+    ref = {}
+    for i, e in enumerate(index):
+        if walked[i] <= 0:
+            continue
+        d = access + np.minimum(far[:, a[e]], far[:, b[e]])
+        c = int(np.argmin(d * penalty))
+        if d[c] <= PARK_REACH:
+            ref[i] = c
+            park_m[i] = d[c]
+
+    # Round walks from each of those car parks.
+    on = {e for i, e in enumerate(index) if walked[i] >= WALKED_SHARE}
+    for c in sorted(set(ref.values())):
+        near_park = np.flatnonzero(np.maximum(far[c, a], far[c, b]) + access[c] <= ACCESS)
+        edges = np.array(sorted(on | set(near_park.tolist())), dtype=int)
+        m, pair = graph(edges)
+        d, pred = dijkstra(m, indices=park_node[c], return_predecessors=True, limit=LOOP_MOST / 2)
+        tree = {pair[(min(n, p), max(n, p))] for n, p in enumerate(pred) if p >= 0}
+        best = {}
+        for e in edges:
+            if e in tree or a[e] == b[e] or not (np.isfinite(d[a[e]]) and np.isfinite(d[b[e]])):
+                continue
+            walk = d[a[e]] + length[e] + d[b[e]] + 2 * access[c]
+            if walk > LOOP_MOST:
+                continue
+            up, n = set(), a[e]
+            while n >= 0:
+                up.add(n)
+                n = pred[n]
+            meet = b[e]
+            while meet not in up:
+                meet = pred[meet]
+            if 2 * (d[meet] + access[c]) > REPEAT * walk:
+                continue
+            loop = [e]
+            for n in (a[e], b[e]):
+                while n != meet:
+                    loop.append(pair[(min(n, pred[n]), max(n, pred[n]))])
+                    n = pred[n]
+            for f in loop:
+                best[f] = min(best.get(f, np.inf), walk)
+        for i, e in enumerate(index):
+            if ref.get(i) == c and e in best:
+                loop_m[i] = best[e]
+    return park_m, loop_m
 
 
 def along(line, step):
@@ -143,8 +286,8 @@ def runs(values):
     return [(a, b) for a, b in zip(np.r_[0, cut], np.r_[cut, len(values)]) if values[a]]
 
 
-def tile_lines(path, z, x, y, walking, driving):
-    """A reference's lines: (longitudes and latitudes, heat, mapped, road) each."""
+def tile_lines(path, z, x, y, walking, driving, parks):
+    """A reference's lines: (longitudes and latitudes, heat, mapped, road, park_m, loop_m) each."""
     image = Image.open(path)
     if image.mode != "P":
         raise SystemExit(f"{path}: not a heat tile as fetched (its palette index is the heat)")
@@ -175,11 +318,11 @@ def tile_lines(path, z, x, y, walking, driving):
 
     # The ways, read every STEP metres; the driving graph's, to tell the roads.
     ways = ways_near(walking, *box)
-    lines = [shapely.linestrings(px(lo, la)) for _, _, lo, la in ways]
+    lines = [shapely.linestrings(px(lo, la)) for _, _, _, lo, la in ways]
     points = [along(line, STEP / mpp) for line in lines]
     owner = np.repeat(np.arange(len(ways)), [len(p) for p in points])
     points = np.concatenate(points) if points else np.zeros((0, 2))
-    roads = [along(shapely.linestrings(px(lo, la)), 2 * STEP / mpp) for _, _, lo, la in ways_near(driving, *box)]
+    roads = [along(shapely.linestrings(px(lo, la)), 2 * STEP / mpp) for _, _, _, lo, la in ways_near(driving, *box)]
     road = np.zeros(len(ways), bool)
     if roads and len(points):
         near_road = cKDTree(np.concatenate(roads)).query(points, distance_upper_bound=ROAD_NEAR / mpp)[0] < np.inf
@@ -223,13 +366,20 @@ def tile_lines(path, z, x, y, walking, driving):
         heats.append(h)
     # A short way between walked ones: the heat at the junction went to them.
     ends = {}
-    for (u, v, _, _), h in zip(ways, heats):
+    for (_, u, v, _, _), h in zip(ways, heats):
         for node, value in ((u, h[0]), (v, h[-1])):
             if value:
                 ends[node] = max(ends.get(node, 0), value)
-    for i, (u, v, _, _) in enumerate(ways):
+    for i, (_, u, v, _, _) in enumerate(ways):
         if not heats[i].any() and u in ends and v in ends and shapely.length(lines[i]) * mpp <= SHORT:
             heats[i][:] = min(ends[u], ends[v])
+
+    # From the car parks: how far, and the shortest round walk.
+    walked = [float(np.mean(h > 0)) for h in heats]
+    park_m, loop_m = from_car_parks(walking, parks, box, ways, walked)
+
+    def hundreds(m):
+        return int(math.ceil(m / 100) * 100) if m is not None else 0
 
     out = []  # in pixels, until the end
     for i, h in enumerate(heats):
@@ -239,7 +389,8 @@ def tile_lines(path, z, x, y, walking, driving):
             # On to the next stretch's first point, so that they meet.
             stretch = at[a:min(b + 1, len(at))]
             if len(stretch) >= 2:
-                out.append((shapely.simplify(shapely.linestrings(stretch), 0.5 / mpp), int(q[a]), 1, int(road[i])))
+                out.append((shapely.simplify(shapely.linestrings(stretch), 0.5 / mpp), int(q[a]), 1, int(road[i]),
+                            hundreds(park_m.get(i)), hundreds(loop_m.get(i))))
     along_ways = len(out)
 
     # Off the ways: the core beyond reach of them, thinned, spurs off, short pieces out.
@@ -285,11 +436,15 @@ def tile_lines(path, z, x, y, walking, driving):
             q = level(h)
             # Round, its ends where they were, for the joins.
             p[1:-1] = ndimage.uniform_filter1d(p, size=min(round(ROUND / mpp) | 1, len(p) | 1), axis=0, mode="nearest")[1:-1]
-            # Joined on to a way it ends near.
-            joins = [None, None]
+            # Joined on to a way it ends near: as far from a car park as the nearer of them.
+            joins, metres = [None, None], []
             for e, end in enumerate((0, -1)):
                 if away[r[end], c[end]] <= join:
-                    joins[e] = points[tree.query(p[end])[1]]
+                    k = tree.query(p[end])[1]
+                    joins[e] = points[k]
+                    if owner[k] in park_m:
+                        metres.append(park_m[owner[k]])
+            far = hundreds(min(metres)) if metres else 0
             stretches = runs(q)
             for k, (a, b) in enumerate(stretches):
                 stretch = p[a:min(b + 1, len(p))]
@@ -298,15 +453,16 @@ def tile_lines(path, z, x, y, walking, driving):
                 if k == len(stretches) - 1 and joins[1] is not None:
                     stretch = np.vstack([stretch, joins[1]])
                 if len(stretch) >= 2:
-                    out.append((shapely.simplify(shapely.linestrings(stretch), 0.25), int(q[a]), 0, 0))
+                    out.append((shapely.simplify(shapely.linestrings(stretch), 0.25), int(q[a]), 0, 0, far, 0))
 
     print(f"    {os.path.basename(path)}: {along_ways} lines along ways ({int(road.sum())} of {len(ways)} ways near it roads), "
-          f"{len(out) - along_ways} off them", flush=True)
-    return [(degrees(shapely.get_coordinates(line)), q, mapped, is_road) for line, q, mapped, is_road in out]
+          f"{len(out) - along_ways} off them; {len(park_m)} walked ways within {PARK_REACH / 1000:.0f} km of a car park, "
+          f"{len(loop_m)} on a round walk from it of {LOOP_MOST / 1000:.0f} km or less", flush=True)
+    return [(degrees(shapely.get_coordinates(line)), *rest) for line, *rest in out]
 
 
 def main():
-    area, bounds, walking_path, driving_path, folder, out = sys.argv[1:7]
+    area, bounds, walking_path, driving_path, parks_path, folder, out = sys.argv[1:8]
     t = time.time()
     os.makedirs(out, exist_ok=True)
     for old in glob.glob(os.path.join(out, "walked.*")):
@@ -317,18 +473,21 @@ def main():
         return
     keys = ("lat", "lon", "geom", "u", "v")
     with np.load(walking_path) as w, np.load(driving_path) as d:
-        walking = {k: w[k] for k in keys}
+        walking = {k: w[k] for k in keys + ("length", "node_lat", "node_lon")}
         driving = {k: d[k] for k in keys}
+    parks = read_parks(parks_path)
     lines = []
     for path, z, x, y in found:
-        lines += tile_lines(path, z, x, y, walking, driving)
+        lines += tile_lines(path, z, x, y, walking, driving, parks)
     w = shapefile.Writer(os.path.join(out, "walked"), shapeType=shapefile.POLYLINE)
     w.field("heat", "N", size=3)
     w.field("mapped", "N", size=1)
     w.field("road", "N", size=1)
-    for xy, q, mapped, road in lines:
+    w.field("park_m", "N", size=5)
+    w.field("loop_m", "N", size=5)
+    for xy, *record in lines:
         w.line([np.round(xy, 7).tolist()])
-        w.record(q, mapped, road)
+        w.record(*record)
     w.close()
     with open(os.path.join(out, "walked.prj"), "w") as f:
         f.write(pyproj.CRS.from_epsg(4326).to_wkt(pyproj.enums.WktVersion.WKT1_ESRI))

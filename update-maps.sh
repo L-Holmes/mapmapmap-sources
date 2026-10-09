@@ -264,6 +264,8 @@ WANT="$NEWEST.$(revision)"
 echo "    published: $PUBLISHED; newest data and this pipeline would be: $WANT"
 if [[ "$PUBLISHED" == "$WANT" && "$FORCE" -eq 0 ]]; then
   echo "==> The published maps are already from the newest data and this pipeline. Nothing to do (--force rebuilds anyway)."
+  echo "    Phones get them by updating each area in the app. Changes to the app itself (how the map looks, its"
+  echo "    settings) are not maps: they reach a phone with ./deploy.sh in mapmapmap."
   exit 0
 fi
 

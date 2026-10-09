@@ -4,7 +4,7 @@ How far each car park is from the nearest path a walk would use, for the
 app to show only those a walk might start from: not the supermarket's, the
 station's or the multi-storey in town.
 
-    parking.py <area> <osm.pbf> <out.tsv>
+    parking.py <area> <osm.pbf> <out.tsv> <parks.tsv>
 
 A path a walk would use is a path, footway, bridleway, track, steps or
 cycleway that walkers may use (as the walking graph has it, graph.py),
@@ -26,8 +26,15 @@ id ("n123", "w456", "r789"), and the metres from it (a node; for one
 mapped as an area, the middle of its outline) to the nearest point of
 such a path, rounded to 10, at most MOST. pipeline/hiking/Hiking.java puts
 it on each car park as "path_m".
+
+<parks.tsv>: each car park a walk might start from, for pipeline/walked.py:
+its key, longitude, latitude, spaces (as Hiking.java has them: mapped, or
+worked out from its area; blank for neither) and metres to such a path.
+That is, a car park Hiking.java draws (not closed to the public, not a
+garage) that is not for customers only.
 """
 import os
+import re
 import sys
 import time
 
@@ -42,6 +49,12 @@ CELL = 50
 EVERY = 25  # metres between the points a path is read at
 MOST = 5000
 TOWN, GREEN, CANAL = 1, 2, 3
+# As Hiking.java has them: car parks the public may not use, garages, and what a space takes by the kind of car park.
+CLOSED = {"private", "no", "residents", "staff", "employees", "permit", "delivery", "disabled", "emergency", "military",
+          "agricultural", "forestry"}
+GARAGES = {"garage_boxes", "garages", "garage", "carports", "sheds"}
+STREET = {"street_side", "lane", "on_kerb", "half_on_kerb", "shoulder"}
+COUNT = re.compile(r"\s*(?:~|c\.|ca\.|approx\.?)?\s*(\d+).*")
 PATHS = {"path", "footway", "bridleway", "track", "steps", "cycleway"}
 PAVEMENTS = {"sidewalk", "crossing", "traffic_island", "access_aisle"}
 UNPAVED = {"unpaved", "ground", "dirt", "earth", "grass", "gravel", "fine_gravel", "compacted", "mud", "sand",
@@ -63,6 +76,39 @@ def walk_path(tags):
             or "sac_scale" in tags or "trail_visibility" in tags or tags.get("towpath") == "yes")
 
 
+def count(value):
+    """A count as mapped ("40", "~40", "c. 40", "1000+"), as Hiking.java's count() reads it; None if none."""
+    m = COUNT.fullmatch(value or "")
+    if not m or len(m.group(1)) > 6 or int(m.group(1)) == 0:
+        return None
+    return int(m.group(1))
+
+
+def spaces(tags, area):
+    """
+    A car park a walk might start from: its spaces as Hiking.java works them
+    out (mapped, else from its area in m², if it has one), 0 for not known;
+    or None for one that is closed, a garage, or for customers only.
+    """
+    kind = tags.get("parking", "surface")
+    if tags.get("access", "") in CLOSED or kind in GARAGES or tags.get("access") == "customers":
+        return None
+    n = count(tags.get("capacity"))
+    if n is None and area:
+        levels = count(tags.get("parking:levels") or tags.get("building:levels"))
+        per = 14 if kind in STREET else (26 / levels if levels else 6) if kind == "multi-storey" \
+            else (26 / levels if levels else 12) if kind == "underground" else 24
+        n = max(1, round(area / per))
+    return n or 0
+
+
+def area_m2(ring):
+    """A ring's area, lon/lat, in square metres, near enough for a car park."""
+    k = np.cos(np.radians(ring[:, 1].mean()))
+    x, y = ring[:, 0] * 111_320 * k, ring[:, 1] * 110_574
+    return abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))) / 2
+
+
 def land(tags):
     """What an area says of the land: TOWN, GREEN, or None."""
     if tags.get("leisure") in GREEN_LEISURE or tags.get("landuse") in GREEN_LANDUSE \
@@ -78,7 +124,7 @@ def read(pbf):
     One read of the OpenStreetMap data: the paths walkers may use, as
     (lon, lat arrays, away from the town by what it is); the canals' lines;
     built-up and green areas' outlines, with holes, as (kind, outer, holes);
-    and the car parks, as (key, lon, lat).
+    and the car parks, as (key, lon, lat, spaces), spaces as spaces() has them.
     """
     import osmium
     paths, canals, areas, parks = [], [], [], []
@@ -93,7 +139,7 @@ def read(pbf):
         tags = o.tags
         if o.is_node():
             if tags.get("amenity") == "parking":
-                parks.append((f"n{o.id}", o.location.lon, o.location.lat))
+                parks.append((f"n{o.id}", o.location.lon, o.location.lat, spaces(tags, None)))
             continue
         if o.is_way():
             away = walk_path(tags)
@@ -124,7 +170,7 @@ def read(pbf):
                 continue
             if parking:
                 key = f"w{o.orig_id()}" if o.from_way() else f"r{o.orig_id()}"
-                parks.append((key, *ring[:-1].mean(axis=0)))
+                parks.append((key, *ring[:-1].mean(axis=0), spaces(tags, area_m2(ring))))
                 break
             holes = []
             for inner in o.inner_rings(outer):
@@ -184,7 +230,7 @@ def walk_points(paths, grid, to_local):
 
 def main():
     from scipy.spatial import cKDTree
-    area, pbf, out = sys.argv[1:4]
+    area, pbf, out, parks_out = sys.argv[1:5]
     t = time.time()
     g = AREAS[area].grid(CELL)
     to_grid = pyproj.Transformer.from_crs("EPSG:4326", g.crs, always_xy=True).transform
@@ -204,9 +250,14 @@ def main():
     d, _ = cKDTree(points).query(np.column_stack([e, n]), distance_upper_bound=MOST)
     metres = np.minimum(np.round(np.nan_to_num(d, posinf=MOST) / 10) * 10, MOST).astype(int)
     with open(out + ".part", "w") as f:
-        for (key, _, _), m in zip(parks, metres):
+        for (key, _, _, _), m in zip(parks, metres):
             f.write(f"{key}\t{m}\n")
     os.replace(out + ".part", out)
+    with open(parks_out + ".part", "w") as f:
+        for (key, lon, lat, n), m in zip(parks, metres):
+            if n is not None:
+                f.write(f"{key}\t{lon:.7f}\t{lat:.7f}\t{n or ''}\t{m}\n")
+    os.replace(parks_out + ".part", parks_out)
     near = int((metres <= 500).sum())
     print(f"parking: {len(parks)} car parks, {near} ({100 * near / max(len(parks), 1):.0f}%) within 500 m of a path"
           f" a walk would use, in {time.time() - t:.0f}s")
