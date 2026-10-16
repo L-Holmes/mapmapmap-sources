@@ -66,15 +66,18 @@ import java.util.regex.Pattern;
  *                 to its base, the place it rises most from, and a point
  *                 there, with "kind" and "peak_score", the summit's score.
  *   walked        how much ways are walked, as lines, where there is a
- *                 reference heat tile (pipeline/walked.py), from zoom 10:
+ *                 Strava heatmap tile (pipeline/walked.py's walked.gpkg), from zoom 11 (as drawn):
  *                 "heat" 1 to 255 (half-octave steps); "mapped" 1 along
  *                 a way the map has, absent where people walk and the map
  *                 has no way; "road" 1 along a way cars use; "park_m", the
  *                 metres on foot from the car park a walker would start
  *                 from, and "loop_m", the shortest round walk from it that
- *                 takes the line in (each to the next 100, where there is one).
+ *                 takes the line in, "loop_pop_m" the shortest coming back
+ *                 along popular ways, "loop_off_m" the shortest mostly off
+ *                 the roads, "loop_po_m" both (each in whole km, as the app
+ *                 asks for them, where there is one).
  *
- *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --jut=<dir> --parking=<tsv> --walked=<dir> --output=...
+ *   java -cp planetiler.jar Hiking.java --osm-path=... --contours=<dir> --jut=<dir> --parking=<tsv> --walked=<gpkg> --output=...
  */
 public class Hiking implements Profile {
 
@@ -153,7 +156,10 @@ public class Hiking implements Profile {
         .setAttr("road", sf.getLong("road") == 1 ? 1 : null)
         .setAttr("park_m", sf.getLong("park_m") > 0 ? sf.getLong("park_m") : null)
         .setAttr("loop_m", sf.getLong("loop_m") > 0 ? sf.getLong("loop_m") : null)
-        .setMinZoom(10)
+        .setAttr("loop_pop_m", sf.getLong("loop_pop_m") > 0 ? sf.getLong("loop_pop_m") : null)
+        .setAttr("loop_off_m", sf.getLong("loop_off_m") > 0 ? sf.getLong("loop_off_m") : null)
+        .setAttr("loop_po_m", sf.getLong("loop_po_m") > 0 ? sf.getLong("loop_po_m") : null)
+        .setMinZoom(11)
         .setMinPixelSize(0);
       return;
     }
@@ -393,9 +399,10 @@ public class Hiking implements Profile {
       return items;
     }
     if (layer.equals("walked")) {
-      // Joined the same, but none dropped for being short: a way's heat changes along it, and a
-      // short stretch of one heat left out would be a gap in the line.
-      return FeatureMerge.mergeLineStrings(items, 0, 0.25, 4);
+      // Joined the same, but from zoom 13 none dropped for being short: a way's heat changes along
+      // it, and a short stretch of one heat left out would be a gap in the line. Further out, under
+      // half a pixel (10 m and more) is no gap that shows, and there are a great many of them.
+      return FeatureMerge.mergeLineStrings(items, zoom <= 12 ? 0.5 : 0, 0.25, 4);
     }
     // Join the pieces of each line that share their attributes, so dashes
     // and labels run on across way boundaries.
@@ -416,14 +423,14 @@ public class Hiking implements Profile {
     Arguments arguments = Arguments.fromArgsOrConfigFile(args);
     Path contours = arguments.file("contours", "contour shapefile directory", Path.of("contours"));
     Path jut = arguments.file("jut", "peak score shapefile directory (pipeline/jut.py)", Path.of("jut"));
-    Path walked = arguments.file("walked", "how much ways are walked, shapefile directory (pipeline/walked.py)", Path.of("walked"));
+    Path walked = arguments.file("walked", "how much ways are walked, the GeoPackage pipeline/walked.py writes", Path.of("walked.gpkg"));
     PATH_M = pathM(arguments.file("parking", "car parks' metres to a walk's path (pipeline/parking.py)", Path.of("parking.tsv")));
     Planetiler.create(arguments)
       .setProfile(new Hiking())
       .addOsmSource("osm", arguments.inputFile("osm_path", "OSM input file", Path.of("input.osm.pbf")))
       .addShapefileGlobSource("EPSG:4326", "contours", contours, "*.shp", null)
       .addShapefileGlobSource("EPSG:4326", "jut", jut, "*.shp", null)
-      .addShapefileGlobSource("EPSG:4326", "walked", walked, "*.shp", null)
+      .addGeoPackageSource("EPSG:4326", "walked", walked, null)
       .overwriteOutput(arguments.file("output", "output file", Path.of("hiking.mbtiles")))
       .run();
   }

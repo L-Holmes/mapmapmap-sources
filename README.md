@@ -170,7 +170,7 @@ then the overview and the catalogue.
 | `pipeline/relief.py` | The relief's raster tiles from the height grid, round the area's regions: hill shading (`shade.mbtiles`, zooms 8 to 12) and steep ground in bands from 25° (`slope.mbtiles`, zooms 8 to 14; the zooms below keep the steepest pixel, so it shows zoomed out). Kept from the last run while the heights and the script are as they were. |
 | `pipeline/jut.py` | Each named peak's scores, how impressively it rises above the paths and roads, the sea and the lakes round it, and the place it rises most from (see below), for the hiking tiles' `jut` layer. |
 | `pipeline/parking.py` | How far each car park is from the nearest path a walk would use (see below), for the app to leave out the car parks in town. |
-| `pipeline/walked.py` | How much each way is walked, as lines, where there is a reference heat tile in `data/src/walked` (see below), for the hiking tiles' `walked` layer. |
+| `pipeline/walked.py` | How much each way is walked, as lines, from Strava's heatmap tiles in `data/src/walked/strava-run.mbtiles` (see below), with each line's car park and round walks, into a GeoPackage for the hiking tiles' `walked` layer. |
 | Planetiler, OpenMapTiles profile | The base map: land, water, roads, places, peaks, to z14. |
 | `pipeline/hiking/Hiking.java` | A Planetiler profile of our own for what OpenMapTiles leaves out: every path with its UK right of way (`row`), SAC difficulty, faint or private access; waymarked routes from route relations; the contours; every named peak; and every car park the public may use, from zoom 10, with its spaces (mapped, or worked out from its area: see below), fee, and whether it is for customers only; the peak scores `jut.py` works out; and how walked the ways are, from `walked.py`. |
 | `pipeline/tiles.py merge` | Both tile sets in one file. A vector tile's layers are a repeated protobuf field, so two tiles' bytes, concatenated, are one tile with both sets of layers. |
@@ -251,35 +251,33 @@ into it.
 
 ### How walked
 
-The `walked` layer is read from reference heat tiles: Strava heatmap
-tiles, one at a time, fetched with mapmapmap's `PYTHON/get-single-tile.py`
-and put in `data/src/walked` under the name it gives them (which says which
-tile each is). A tile's palette index is its heat. `walked.py` finds the
-core of each line of heat (where it is at least half the heat round it),
-read at ~2 m, and gives each bit of it within 1.5 reference pixels (34 m
-at zoom 11) to the nearest way of the walking graph; heat within 11 m of a
-way is its own too, the core of a line or not (in a town the streets are
-closer than the reference tells apart). Along each way the heat is made to
-run on: gaps of up to 50 m filled, the heat a median over 51 m, run on to
-a junction from 60 m, and ways of up to 120 m between walked ones walked
-too. On the Pendle tile, every way under heat of 100 or more gets a line,
-and 3% of the line drawn is over no heat at all.
-Where people walk and the map has no way (heat 2 or more), the core is
-thinned to lines, joined on to the ways they end near; scraps on their own
-and lines that only shadow a way are left out. Each line has its heat in
-half-octave steps, `mapped` 1 along a way, and `road` 1 along a way cars
-use (one of the driving graph's: not a track, path, footway or
-driveway). The tiles carry them from zoom 10.
+The `walked` layer is read from Strava's run heatmap at zoom 11, fetched by
+mapmapmap's `PYTHON/fetch-strava.py` into `data/src/walked/strava-run.mbtiles`
+(one SQLite file: every tile over Great Britain with a way in it, about 2,200).
+A tile's palette index is its heat. The whole method is mapmapmap's
+`STRAVA_METHOD.md`; in short, `walked.py`:
 
-Each walked line also says how far it is on foot from the car park a
-walker would start from (`park_m`), and the shortest round walk from that
-car park that takes it in (`loop_m`), up to 5 km. The car parks are those
-the app shows, as `parking.py` lists them (`parks.tsv`); a line's is the
-one the least far along the ways, times a little more the fewer spaces it
-has, so a bigger one nearer always wins. A round walk follows walked ways
-(and any way within 300 m of the car park, to reach them), and at most 40%
-of it is walked twice. The app filters the off-road lines by them. The references are hashed into the pipeline's
-revision (`common.sh`), so adding one is a new version, which
+- a tile at a time, several at once, with 720 m of its neighbours' heat
+  round it: finds the core of each line of heat (where it is at least half
+  the heat round it), read at ~4 m; gives each bit within 1.5 reference
+  pixels (34 m) to the nearest way of the walking graph (and any heat
+  within 11 m of a way to that way); makes the heat run on along each way
+  (gaps of up to 50 m filled, a median over 51 m, run on to junctions,
+  short ways between walked ones walked); traces heat with no way under it
+  (2 or more) into lines joined on to the ways; and tells the roads (the
+  driving graph's ways) from the rest. Each tile's results are kept in
+  `data/work/<area>/walked/walked-tiles.sqlite`, so a stopped build carries on.
+- then for the whole area: each walked way's car park (the nearest on foot
+  of those the app shows, a small one counting as further: `parking.py`'s
+  `parks.tsv`), and the shortest round walks from it, up to 10 km, at most
+  40% walked twice; coming back along popular ways; at least 80% off road.
+
+It writes `data/work/<area>/walked/walked.gpkg`, a GeoPackage of every line
+with `heat`, `mapped`, `road`, `park_m`, `loop_m`, `loop_pop_m`,
+`loop_off_m` and `loop_po_m` (the distances in the whole kilometres the app
+asks for), which `Hiking.java` reads, from zoom 11. Great Britain takes
+about an hour. The Strava file is part of the pipeline's revision
+(`common.sh`), so fetching new tiles is a new version, which
 `update-maps.sh` builds and publishes.
 
 ### The walking graph

@@ -243,8 +243,10 @@ build_area() {
   mkdir -p "$W/parking"
   $PY -u pipeline/parking.py "$area" "$PBF" "$W/parking/near.tsv" "$W/parking/parks.tsv"
 
-  next "how much the ways are walked, where there are reference heat tiles ($SRC/walked)" "seconds"
-  $PY -u pipeline/walked.py "$area" "$BOUNDS" "$W/graph.npz" "$W/driving.npz" "$W/parking/parks.tsv" "$SRC/walked" "$W/walked"
+  next "how much the ways are walked, from Strava's heatmap ($SRC/walked/strava-run.mbtiles)" \
+    "about an hour for Great Britain, a tile at a time with its progress shown; seconds where there are no tiles"
+  $PY -u pipeline/walked.py "$area" "$BOUNDS" "$W/graph.npz" "$W/driving.npz" "$W/parking/parks.tsv" \
+    "$SRC/walked/strava-run.mbtiles" "$W/walked"
 
   # Outside Great Britain, tiles only round the regions: the extract's
   # bounds hold a lot of sea and other countries, all empty tiles.
@@ -264,7 +266,7 @@ build_area() {
   next "hiking tiles: paths, rights of way, routes, contours, car parks, peak scores, how walked" "$(usually 3)"
   echo "    Planetiler's own log follows; its \"data errors:\" list at the end is usually empty: expected."
   java -Xmx12g -cp "$SRC/planetiler.jar" pipeline/hiking/Hiking.java --osm-path="$PBF" \
-    --contours="$W/terrain/contours" --jut="$W/jut" --parking="$W/parking/near.tsv" --walked="$W/walked" \
+    --contours="$W/terrain/contours" --jut="$W/jut" --parking="$W/parking/near.tsv" --walked="$W/walked/walked.gpkg" \
     --output="$W/hiking.mbtiles" \
     --tmpdir="$WORK/tmp" --force --maxzoom=14 --bounds="$BOUNDS" "${polygon[@]}"
 
