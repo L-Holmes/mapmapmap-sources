@@ -2,8 +2,9 @@
 #
 # Update the maps everyone downloads.
 #
-#   ./update-maps.sh           finish an interrupted upload, or carry on an
-#                              interrupted build; otherwise, if
+#   ./update-maps.sh           finish an interrupted upload, carry on an
+#                              interrupted build, or publish a finished one
+#                              that never went up; otherwise, if
 #                              OpenStreetMap has newer data than what is
 #                              published, or the pipeline has changed since,
 #                              rebuild every region and publish it
@@ -25,7 +26,7 @@ FORCE=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 1 ;;
   esac
 done
@@ -36,24 +37,63 @@ done
 # once every file is up, so no app sees a catalogue whose files are still
 # uploading; a draft of it is an upload that stopped partway, carried on
 # from where it got to. The release before stays, so a download begun from
-# it can finish; older ones are deleted. GitHub's limit is 2 GiB a file.
+# it can finish; older ones are deleted. GitHub's limit is 2 GiB a file:
+# a file over 1.5 GiB (all of Great Britain's tiles, England's) goes up in
+# pieces, <name>.1, <name>.2, ..., which the catalogue lists under it, and
+# the app joins them back into it.
 publish() {
   OUT=data/out
+  # The pieces, and the catalogue that lists them: cut afresh each time, the
+  # same each time, so an upload carried on finds what it had.
+  UP=data/release
   KEEP=2
   PARALLEL=4
   VERSION=$(python3 -c "import json; print(json.load(open('$OUT/catalog.json'))['version'])")
   TAG="maps-$VERSION"
   LIMIT=$((2 * 1024 * 1024 * 1024))
-  # The catalogue, the regions' files it lists, and the two files the app
-  # ships and refreshes from here, the region outlines and the low-zoom
-  # overview: just those, whatever else is in data/out.
-  mapfile -t FILES < <(python3 -c "
-import json, sys
-out = sys.argv[1]
-c = json.load(open(out + '/catalog.json'))
-print(out + '/catalog.json')
-for name in [f['name'] for r in c['regions'] for f in r['files']] + [f['name'] for f in c.get('assets', [])]:
-    print(out + '/' + name)" "$OUT")
+  # Well under the limit: uploads of files near it have been known to fail.
+  PIECE=$((1536 * 1024 * 1024))
+  # The catalogue, the regions' files it lists (or their pieces), and the two
+  # files the app ships and refreshes from here, the region outlines and the
+  # low-zoom overview: just those, whatever else is in data/out.
+  rm -rf "$UP"
+  mkdir -p "$UP"
+  mapfile -t FILES < <(python3 - "$OUT" "$UP" "$PIECE" <<'EOF'
+import json, os, sys
+out, up, most = sys.argv[1], sys.argv[2], int(sys.argv[3])
+c = json.load(open(os.path.join(out, "catalog.json")))
+paths = [os.path.join(up, "catalog.json")]
+for f in [f for r in c["regions"] for f in r["files"]]:
+    path = os.path.join(out, f["name"])
+    if f["size"] <= most:
+        paths.append(path)
+        continue
+    # As few pieces as will do, alike in size to a byte.
+    n = -(-f["size"] // most)
+    ends = [f["size"] * i // n for i in range(n + 1)]
+    print(f"    cutting {f['name']}, {f['size'] // 1000000} MB, into {n} pieces", file=sys.stderr)
+    f["pieces"] = []
+    with open(path, "rb") as src:
+        for i in range(n):
+            name = f"{f['name']}.{i + 1}"
+            with open(os.path.join(up, name), "wb") as dst:
+                left = ends[i + 1] - ends[i]
+                while left:
+                    block = src.read(min(left, 1 << 24))
+                    if not block:
+                        sys.exit(f"{path} ended short of its size in the catalogue")
+                    dst.write(block)
+                    left -= len(block)
+            f["pieces"].append({"name": name, "size": ends[i + 1] - ends[i]})
+            paths.append(os.path.join(up, name))
+paths += [os.path.join(out, a["name"]) for a in c.get("assets", [])]
+with open(os.path.join(up, "catalog.json"), "w") as f:
+    json.dump(c, f, indent=1)
+print("\n".join(paths))
+EOF
+)
+  # Every file listed, or the cutting failed partway.
+  [[ "${FILES[0]:-}" == "$UP/catalog.json" ]] || { echo "error: could not list the files to upload" >&2; exit 1; }
   for f in "${FILES[@]}"; do
     size=$(stat -c %s "$f")
     if (( size >= LIMIT )); then
@@ -83,7 +123,7 @@ for name in [f['name'] for r in c['regions'] for f in r['files']] + [f['name'] f
     # ever sees a catalogue whose files are still uploading.
     NOTES="Map data for Great Britain and Italy, from OpenStreetMap; heights from OS Terrain 50 and the Environment Agency's LIDAR in Great Britain, and the Copernicus DEM in Italy; version $VERSION (Great Britain's data's date, and the pipeline's revision).
 
-Each region is five files: \`<region>.mbtiles\` (vector map tiles), \`<region>.graph\` (the walking graph the app routes on), \`<region>.driving.graph\` (the driving graph), and \`<region>.shade.mbtiles\` and \`<region>.slope.mbtiles\` (raster tiles of hill shading, and of steep ground). \`catalog.json\` lists them with their sizes and SHA-256. \`overview.mbtiles\` and \`app-regions.json\` are what the app ships inside itself.
+Each region is five files: \`<region>.mbtiles\` (vector map tiles), \`<region>.graph\` (the walking graph the app routes on), \`<region>.driving.graph\` (the driving graph), and \`<region>.shade.mbtiles\` and \`<region>.slope.mbtiles\` (raster tiles of hill shading, and of steep ground). \`catalog.json\` lists them with their sizes and SHA-256. A file over GitHub's limit is here in pieces, \`<file>.1\`, \`<file>.2\`, ...: join them in order (\`cat great-britain.mbtiles.? > great-britain.mbtiles\`). \`overview.mbtiles\` and \`app-regions.json\` are what the app ships inside itself.
 
 © OpenStreetMap contributors, available under the Open Database Licence. Contains OS data © Crown copyright and database right. Contains Environment Agency LIDAR data © Environment Agency copyright and/or database right, under the Open Government Licence v3.0. Heights in Italy produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved."
     gh release create "$TAG" --repo "$REPO" --draft --title "Maps $VERSION" --notes "$NOTES"
@@ -192,6 +232,7 @@ Each region is five files: \`<region>.mbtiles\` (vector map tiles), \`<region>.g
         echo "    deleting $old"
         gh release delete "$old" --repo "$REPO" --yes --cleanup-tag
       done
+  rm -rf "$UP"
 
   echo "==> Published: https://github.com/$REPO/releases/latest/download/catalog.json"
 }
@@ -252,6 +293,22 @@ if (( DONE > 0 && (DONE < AREAS || UNFINISHED) )); then
   echo
   echo "==> Maps updated in $(elapsed). Run this again to check for anything newer."
   exit 0
+fi
+
+# A build that finished, by this pipeline, but never went up (its upload
+# stopped before it began) goes up as it is, rather than being built again
+# for hours from newer data: anything newer waits for the next run.
+if (( !FORCE && AREAS > 0 && DONE == AREAS && !UNFINISHED )) && [[ "$BUILT" == *".$(revision)" ]]; then
+  # Read here, not in the test above, so that a dropped connection stops the
+  # run rather than passing for "not up".
+  UP_THERE=$(gh release list --repo "$REPO" --limit 100 --json tagName --jq ".[] | select(.tagName == \"maps-$BUILT\") | .tagName")
+  if [[ -z "$UP_THERE" ]]; then
+    echo "==> The maps built last time, $BUILT, never went up: publishing them"
+    publish
+    echo
+    echo "==> Maps updated in $(elapsed). Run this again to check for anything newer."
+    exit 0
+  fi
 fi
 
 # Is there anything newer to build? A version is the map data's date and

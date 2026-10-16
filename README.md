@@ -20,6 +20,13 @@ https://github.com/L-Holmes/mapmapmap-sources/releases/latest/download/catalog.j
 | `<region>.shade.mbtiles`, `<region>.slope.mbtiles` | The hiking map's relief, raster tiles: hill shading (zooms 8 to 12), and steep ground in bands from 25° (zooms 8 to 14); from the Environment Agency's LIDAR in England, OS Terrain 50 elsewhere in Great Britain, the Copernicus DEM everywhere else |
 | `overview.mbtiles`, `app-regions.json` | What the app ships inside itself: zooms 0 to 7 everywhere, and the region outlines. The app repository's `tools/refresh-assets.sh` copies them in; the catalogue lists them too (`assets`), and an app with other copies fetches these, so new regions and the low zooms reach it with the maps. |
 
+GitHub takes up to 2 GiB a file, so a file over 1.5 GiB is in the release
+in pieces, `<file>.1`, `<file>.2`, ... (since October 2026, when the walked
+layer took all of Great Britain's tiles to 2.8 GB and England's to 1.9).
+The catalogue lists them under the file (`pieces`, each's name and size);
+the app fetches each, joins them in order, and checks the whole against
+its SHA-256. By hand: `cat great-britain.mbtiles.? > great-britain.mbtiles`.
+
 Regions (Geofabrik's boundaries):
 
 - all of Great Britain, England, Scotland, Wales, and England's 47
@@ -45,8 +52,10 @@ Adding one there is all it takes to have it again.
 
 That is the whole job. In order, it:
 
-1. finishes an upload that stopped partway, if there is one, and stops
-   there: the maps are out (run it again for anything newer);
+1. finishes an upload that stopped partway, if there is one, or publishes
+   a finished build that never went up (its upload stopped before it
+   began), and stops there: the maps are out (run it again for anything
+   newer);
 2. checks whether OpenStreetMap has newer data than what is published, or
    the pipeline has changed since, and stops there if neither (`--force`
    rebuilds anyway);
@@ -108,6 +117,12 @@ build before publishing it.
 - The release before the newest is kept, so a download already under way
   finishes; older ones are deleted. Publishing the same data twice replaces
   its release.
+- The pieces of files over 1.5 GiB, and the catalogue listing them, are cut
+  into `data/release` as publishing starts (a few seconds), the same each
+  time, so an upload carried on finds what is up already; `data/out` stays
+  as the build left it. A catalogue with pieces is the same `format`: an
+  app from before them fetches every region but those few files' (all of
+  Great Britain, England), which fail as missing on the server.
 - `format` in the catalogue is what an app must understand to use the files
   (the tiles' layers, the graph's layout). Raise `FORMAT` in
   `pipeline/catalog.py` and in the app's `Downloads.kt` together when either
